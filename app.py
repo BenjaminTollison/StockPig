@@ -21,6 +21,11 @@ pages = {
             title="Simplier Predictor",
             icon="🎯",
         ),
+        st.Page(
+            "pages/pickem_optimizer.py",
+            title="Your Chances of Beating the League",
+            icon="🎯",
+        ),
     ],
 
     "Rankings": [
@@ -30,14 +35,6 @@ pages = {
             icon="🏆",
         ),
     ],
-
-    # "Monte-Carlo Predictions": [
-        # st.Page(
-            # "pages/monte_carlo_app.py",
-            # title="Simplier Predictor",
-            # icon="🎯",
-        # ),
-    # ],
 }
 
 page = st.navigation(
