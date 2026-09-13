@@ -56,9 +56,12 @@ DEFAULT_SEASON = datetime.now(timezone.utc).year
 TRAIN_START_SEASON = 2024
 LOOKBACK_GAMES = 8
 VALIDATION_FRACTION = 0.20
-MONTE_CARLO_SIMS = 30000
 RANDOM_SEED = 42
 
+if GPU_ACCELERATION_AVAILABLE:
+    MONTE_CARLO_SIMS = 1_000_000
+else:
+    MONTE_CARLO_SIMS = 30_000
 # Current SEC membership. Numeric ids are ESPN team ids.
 # These are used as a fallback when a schedule loader does not expose conference
 # names directly.
@@ -1502,54 +1505,99 @@ st.caption(
 
 with st.sidebar:
     st.header("Model settings")
-    season = st.number_input(
-        "Season",
-        min_value=2023,
-        max_value=DEFAULT_SEASON + 1,
-        value=DEFAULT_SEASON,
-        step=1,
-    )
-    training_start = st.number_input(
-        "First training season",
-        min_value=2018,
-        max_value=int(season) - 1,
-        value=min(TRAIN_START_SEASON, int(season) - 1),
-        step=1,
-    )
-    lookback_games = st.slider(
-        "Recent games used for team features",
-        min_value=3,
-        max_value=15,
-        value=LOOKBACK_GAMES,
-    )
 
+    # Keep all configuration widgets inside a form. Streamlit does not rerun the
+    # app for each widget change inside a form; values are committed together
+    # only when the submit button is pressed.
+    with st.form("model_config_form"):
+        season_input = st.number_input(
+            "Season",
+            min_value=2023,
+            max_value=DEFAULT_SEASON + 1,
+            value=DEFAULT_SEASON,
+            step=1,
+        )
+        training_start_input = st.number_input(
+            "First training season",
+            min_value=2018,
+            max_value=int(season_input) - 1,
+            value=min(TRAIN_START_SEASON, int(season_input) - 1),
+            step=1,
+        )
+        lookback_games_input = st.slider(
+            "Recent games used for team features",
+            min_value=3,
+            max_value=15,
+            value=LOOKBACK_GAMES,
+        )
+        week_input = st.selectbox(
+            "Week",
+            options=list(range(1, 17)),
+            index=0,
+        )
 
-    if st.button("Clear historical feature cache"):
+        run_model = st.form_submit_button(
+            "Apply settings & train",
+            type="primary",
+            use_container_width=True,
+        )
+
+    if GPU_ACCELERATION_AVAILABLE:
+        st.success(f"GPU acceleration: {accelerator_name()}")
+    else:
+        st.warning("GPU unavailable — using CPU")
+
+    if st.button("Clear model caches", use_container_width=True):
         st.session_state.pop("_historical_training_rows_cache", None)
+        st.session_state.pop("_trained_model_cache", None)
+        st.session_state.pop("_active_model_config", None)
         st.rerun()
 
+# Commit a new configuration only when the form is submitted. Until then the
+# rest of the page uses the last submitted configuration, if one exists.
+if run_model:
+    st.session_state["_active_model_config"] = {
+        "season": int(season_input),
+        "training_start": int(training_start_input),
+        "lookback_games": int(lookback_games_input),
+        "week": int(week_input),
+    }
+
+if "_active_model_config" not in st.session_state:
+    st.info(
+        "Choose the model settings in the sidebar, then click "
+        "**Apply settings & train** to load data and train the model."
+    )
+    st.stop()
+
+config = st.session_state["_active_model_config"]
+season = int(config["season"])
+training_start = int(config["training_start"])
+lookback_games = int(config["lookback_games"])
+week = int(config["week"])
+
 with st.spinner("Loading SportsDataverse play-by-play and schedules..."):
-    pbp, schedule = load_model_data(int(training_start), int(season))
+    pbp, schedule = load_model_data(training_start, season)
 
 available_weeks = sorted(
-    schedule[schedule["season"] == int(season)]["week"].dropna().astype(int).unique()
+    schedule[schedule["season"] == season]["week"].dropna().astype(int).unique()
 )
 
 if not available_weeks:
-    st.error(f"No weeks were found for the {int(season)} season.")
+    st.error(f"No weeks were found for the {season} season.")
     st.stop()
 
-try:
-    default_week = get_default_week(schedule, int(season))
-except ValueError:
-    default_week = available_weeks[0]
-
-with st.sidebar:
-    week = st.selectbox(
-        "Week",
-        available_weeks,
-        index=available_weeks.index(default_week) if default_week in available_weeks else 0,
+if week not in available_weeks:
+    st.error(
+        f"Week {week} is not available for the {season} season. "
+        "Choose another week in the sidebar and click **Apply settings & train** again."
     )
+    st.stop()
+
+st.caption(
+    f"Active configuration: {season} Week {week} • training begins {training_start} • "
+    f"{lookback_games}-game feature lookback"
+)
 
 st.subheader("Model preparation")
 
@@ -1565,14 +1613,14 @@ def update_feature_progress(value: int, message: str) -> None:
     )
 
 # A progress-reporting function should not be decorated with st.cache_data,
-# because Streamlit tries to replay UI side effects on cache hits. Instead,
-# cache the finished DataFrame explicitly in session_state.
+# because Streamlit tries to replay UI side effects on cache hits. Cache the
+# finished DataFrame explicitly in session_state instead.
 training_cache_key = (
     "historical_training_rows",
-    int(training_start),
-    int(season),
-    int(week),
-    int(lookback_games),
+    training_start,
+    season,
+    week,
+    lookback_games,
 )
 
 training_cache = st.session_state.setdefault(
@@ -1591,10 +1639,10 @@ if training_cache_key in training_cache:
     )
 else:
     training_rows = build_historical_training_rows(
-        first_training_season=int(training_start),
-        target_season=int(season),
-        target_week=int(week),
-        lookback_games=int(lookback_games),
+        first_training_season=training_start,
+        target_season=season,
+        target_week=week,
+        lookback_games=lookback_games,
         progress_callback=update_feature_progress,
     )
 
@@ -1619,18 +1667,43 @@ def update_training_progress(value: int, message: str) -> None:
         text=message,
     )
 
-bundle = train_and_validate_model(
-    training_rows,
-    progress_callback=update_training_progress,
+# Keep trained models in session_state. Streamlit reruns the script for normal
+# widgets such as the matchup selector; this prevents those reruns from fitting
+# the validation and production Random Forests again.
+model_cache = st.session_state.setdefault(
+    "_trained_model_cache",
+    {},
 )
 
-training_progress.progress(
-    100,
-    text=(
-        f"Model ready • validation MAE {bundle.mae:.2f} pts • "
-        f"RMSE {bundle.rmse:.2f} pts"
-    ),
+model_cache_key = (
+    training_start,
+    season,
+    week,
+    lookback_games,
 )
+
+if model_cache_key in model_cache:
+    bundle = model_cache[model_cache_key]
+    training_progress.progress(
+        100,
+        text=(
+            f"Model loaded from session cache • validation MAE {bundle.mae:.2f} pts • "
+            f"RMSE {bundle.rmse:.2f} pts"
+        ),
+    )
+else:
+    bundle = train_and_validate_model(
+        training_rows,
+        progress_callback=update_training_progress,
+    )
+    model_cache[model_cache_key] = bundle
+    training_progress.progress(
+        100,
+        text=(
+            f"Model ready • validation MAE {bundle.mae:.2f} pts • "
+            f"RMSE {bundle.rmse:.2f} pts"
+        ),
+    )
 
 # -----------------------------------------------------------------------------
 # Model validation

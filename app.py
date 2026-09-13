@@ -10,14 +10,14 @@ pages = {
         ),
     ],
 
-    "Predictions": [
+    "SEC Pickem Tools": [
         st.Page(
             "pages/predictor_model.py",
             title="Score Predictor",
             icon="🎯",
         ),
         st.Page(
-            "pages/predictor_model_gpu.py",
+            "pages/score_predictor_gpu.py",
             title="Score Predictor GPU",
             icon="🎯",
         ),
@@ -36,9 +36,6 @@ pages = {
             title="How to win at Pickems GPU",
             icon="🎯",
         ),
-    ],
-
-    "Rankings": [
         st.Page(
             "pages/sec_ranking.py",
             title="SEC Weekly Rankings",
