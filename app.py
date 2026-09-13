@@ -10,25 +10,32 @@ pages = {
         ),
     ],
 
-    "Predictions": [
+    "SEC Pickem Tools": [
         st.Page(
             "pages/predictor_model.py",
             title="Score Predictor",
             icon="🎯",
         ),
         st.Page(
+            "pages/score_predictor_gpu.py",
+            title="Score Predictor GPU",
+            icon="🎯",
+        ),
+        st.Page(
             "pages/monte_carlo_app.py",
-            title="Simplier Predictor",
+            title="Monte-Carlo Predictor",
             icon="🎯",
         ),
         st.Page(
             "pages/pickem_optimizer.py",
-            title="Your Chances of Beating the League",
+            title="How to win at Pickems",
             icon="🎯",
         ),
-    ],
-
-    "Rankings": [
+        st.Page(
+            "pages/pickem_optimizer_gpu.py",
+            title="How to win at Pickems GPU",
+            icon="🎯",
+        ),
         st.Page(
             "pages/sec_ranking.py",
             title="SEC Weekly Rankings",

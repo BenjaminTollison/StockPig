@@ -1,6 +1,9 @@
 import streamlit as st
-
-st.title("🏈 StockPig")
+st.image(
+    "assets/StockPig-logo.png",
+    width=150,
+)
+st.title("StockPig")
 st.subheader("Stock is a reference to Stockfish the chess bot")
 st.subheader("Pig is a reference to pigskin")
 
