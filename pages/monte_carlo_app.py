@@ -2,6 +2,7 @@ import numpy as np
 import pandas as pd
 import polars as pl
 import streamlit as st
+import torch
 
 from scipy.stats import norm
 
@@ -10,6 +11,9 @@ import sportsdataverse as sdv
 from sportsdataverse.cfb.cfb_ratings import cfb_ratings
 from sportsdataverse.cfb.cfb_game_predict import cfb_predict_games
 
+DEVICE = torch.device(
+    "cuda:0" if torch.cuda.is_available() else "cpu"
+)
 
 # ---------------------------------------------------------
 # CONFIG
@@ -110,7 +114,7 @@ def get_default_week(schedule: pd.DataFrame, season: int) -> int:
 def get_sec_games(
     schedule: pd.DataFrame,
     season: int,
-    week: int,
+    week,
 ):
 
     games = schedule[
@@ -136,7 +140,7 @@ def get_sec_games(
 def make_ratings(
     schedule: pd.DataFrame,
     season: int,
-    week: int,
+    week,
 ):
     """
     Build opponent-adjusted ratings using only games that occurred
@@ -363,39 +367,46 @@ def simulate_game(
     total_sd,
     n=30000,
 ):
+    if torch.cuda.is_available():
+        n=int(1e6)
+    seed = 42
+    generator = torch.Generator(device=DEVICE)
+    generator.manual_seed(seed)
 
-    rng = np.random.default_rng(42)
-
-    simulated_margin = rng.normal(
-        row["exp_margin"],
-        margin_sd,
-        n,
+    simulated_margin = (
+        torch.rand(
+            n,
+            device=DEVICE,
+            dtype=torch.float32,
+            generator=generator,
+        )
+        * float(margin_sd) + float(row["exp_margin"])
     )
+    simulated_total = (
+            torch.randn(
+                n,
+                device=DEVICE,
+                dtype=torch.float32,
+                generator=generator,
+            )
+            * float(total_sd)
+            + float(row["exp_total"])
+        )
 
-    simulated_total = rng.normal(
-        row["exp_total"],
-        total_sd,
-        n,
-    )
+    home = torch.round(
+            (simulated_total + simulated_margin) / 2
+        )
 
-    home = np.rint(
-        (
-            simulated_total
-            + simulated_margin
-        ) / 2
-    )
+    away = torch.round(
+            (simulated_total - simulated_margin) / 2
+        )
 
-    away = np.rint(
-        (
-            simulated_total
-            - simulated_margin
-        ) / 2
-    )
+    home = torch.clamp(home, min=0).to(torch.int32)
+    away = torch.clamp(away, min=0).to(torch.int32)
 
-    home = np.clip(home, 0, None).astype(int)
-    away = np.clip(away, 0, None).astype(int)
 
-    return home, away
+
+    return home.cpu().numpy(), away.cpu().numpy()
 
 
 def score_distribution(scores):
@@ -455,6 +466,12 @@ week = st.sidebar.selectbox(
     ),
 )
 
+if torch.cuda.is_available():
+    st.sidebar.success(
+        f"GPU acceleration: {torch.cuda.get_device_name(0)}"
+    )
+else:
+    st.sidebar.warning("GPU unavailable — using CPU")
 
 sec_games = get_sec_games(
     schedule,

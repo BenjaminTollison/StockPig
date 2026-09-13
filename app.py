@@ -17,13 +17,23 @@ pages = {
             icon="🎯",
         ),
         st.Page(
+            "pages/predictor_model_gpu.py",
+            title="Score Predictor GPU",
+            icon="🎯",
+        ),
+        st.Page(
             "pages/monte_carlo_app.py",
-            title="Simplier Predictor",
+            title="Monte-Carlo Predictor",
             icon="🎯",
         ),
         st.Page(
             "pages/pickem_optimizer.py",
-            title="Your Chances of Beating the League",
+            title="How to win at Pickems",
+            icon="🎯",
+        ),
+        st.Page(
+            "pages/pickem_optimizer_gpu.py",
+            title="How to win at Pickems GPU",
             icon="🎯",
         ),
     ],
