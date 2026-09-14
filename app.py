@@ -42,6 +42,13 @@ pages = {
             icon="🏆",
         ),
     ],
+    "NFL Fantasy": [
+        st.Page(
+            "fantasy_football/transformer_test.py",
+            title="Transformer Test",
+            icon="🎯",
+        ),
+    ],
 }
 
 page = st.navigation(

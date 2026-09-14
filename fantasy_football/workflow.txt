@@ -1,0 +1,149 @@
+                  ┌─────────────────────┐
+                  │   SportsDataverse   │
+                  │    / nflverse       │
+                  └─────────┬───────────┘
+                            │
+                  Historical NFL data
+                            │
+                            ▼
+                  ┌─────────────────────┐
+                  │ Feature Engineering │
+                  └─────────┬───────────┘
+                            │
+                            ▼
+                  ┌─────────────────────┐
+                  │     Transformer     │
+                  │                     │
+                  │ Player performance  │
+                  │     model           │
+                  └─────────┬───────────┘
+                            │
+                  Player outcome distributions
+                            │
+             ┌──────────────┴──────────────┐
+             │                             │
+             ▼                             ▼
+      Sleeper League                  NFL schedule /
+      State + Rules                   matchup context
+             │                             │
+             └──────────────┬──────────────┘
+                            ▼
+                  ┌─────────────────────┐
+                  │ Fantasy Projection  │
+                  │       Engine        │
+                  └─────────┬───────────┘
+                            │
+          ┌─────────────────┼──────────────────┐
+          ▼                 ▼                  ▼
+       Lineup            Waivers             Trades
+      Optimizer          Optimizer           Optimizer
+          │                 │                  │
+          └─────────────────┼──────────────────┘
+                            ▼
+                 Monte Carlo Simulator
+                            │
+                            ▼
+              BEST EXPECTED FANTASY PLAN
+
+              Starting lineup
+              Expected points
+              Floor / ceiling
+              Win probability
+              Suggested adds/drops
+              Suggested trades
+
+
+
+
+
+SportsDataverse / nflverse
+        ↓
+actual NFL performance
+        ↓
+TRAIN TRANSFORMER
+
+
+
+Sleeper
+   ↓
+Who is on each fantasy roster?
+What are the scoring rules?
+Who are the free agents?
+Who am I playing?
+What positions can I start?
+        ↓
+SportsDataverse
+        ↓
+Build NFL features for those players
+        ↓
+Transformer
+        ↓
+Player outcome distributions
+        ↓
+Sleeper scoring system
+        ↓
+Fantasy point distributions
+        ↓
+Optimizer(
+
+    SAFE
+
+    Maximize:
+    Probability of beating opponent
+
+    Useful when:
+    You're favored.
+
+
+    BALANCED
+
+    Maximize:
+    Expected fantasy points
+
+    Useful when:
+    Matchup is close.
+
+
+    UPSIDE
+
+    Maximize:
+    Probability of exceeding a high target
+
+    Useful when:
+    You're a 20-point underdog.
+  )
+
+
+Phase 1
+Predict player performance
+
+        ↓
+
+Phase 2
+Produce preseason player rankings
+
+        ↓
+
+Phase 3
+Add VORP / positional scarcity
+
+        ↓
+
+Phase 4
+Simulate an entire fantasy draft
+
+        ↓
+
+Phase 5
+Recommend the optimal pick at every selection
+
+        ↓
+
+Phase 6
+Connect Sleeper and draft against the actual league
+
+        ↓
+
+Phase 7
+Reuse the same model for weekly lineup /
+waiver / trade optimization
