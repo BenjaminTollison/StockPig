@@ -175,6 +175,16 @@ def _normalize_name(value: object) -> str:
     return re.sub(r"[^a-z0-9]", "", s.lower())
 
 
+def _normalize_player_id(value: object) -> str:
+    """Normalize GSIS/player IDs before joining stats to the player master."""
+    if pd.isna(value):
+        return ""
+    value = str(value).strip()
+    if value.lower() in {"", "nan", "none", "<na>"}:
+        return ""
+    return value
+
+
 def add_fantasy_points(stats: pd.DataFrame, scoring: FantasyScoring) -> pd.DataFrame:
     """Calculate fantasy points from football stats using configurable scoring."""
     stats = stats.copy()
@@ -267,6 +277,12 @@ def load_sportsdataverse(
 def prepare_weekly_stats(stats: pd.DataFrame) -> pd.DataFrame:
     df = stats.copy()
 
+    if "player_id" not in df.columns:
+        raise ValueError("SportsDataverse player stats are missing player_id.")
+
+    df["player_id"] = df["player_id"].map(_normalize_player_id)
+    df = df[df["player_id"].ne("")].copy()
+
     if "season_type" in df.columns:
         df = df[df["season_type"].astype(str).str.upper().eq("REG")]
 
@@ -293,7 +309,8 @@ def prepare_players(players: pd.DataFrame) -> pd.DataFrame:
     if "gsis_id" not in p.columns:
         raise ValueError("SportsDataverse player master is missing gsis_id.")
 
-    p["gsis_id"] = p["gsis_id"].astype(str)
+    p["gsis_id"] = p["gsis_id"].map(_normalize_player_id)
+    p = p[p["gsis_id"].ne("")].copy()
     p["position"] = p["position"].astype(str).str.upper()
 
     for col in ["height", "weight", "rookie_season", "draft_year", "draft_round", "draft_pick"]:
@@ -736,38 +753,108 @@ def project_veterans(
     static_imputer: SimpleImputer,
     static_scaler: StandardScaler,
 ) -> pd.DataFrame:
+    """
+    Project veteran players for target_season.
+
+    Veteran candidates come from the newest stats season before target_season.
+    Missing player-master metadata does NOT remove a veteran; the static-feature
+    imputer handles missing values instead.
+    """
     stats = prepare_weekly_stats(stats)
     players = prepare_players(players)
-    player_lookup = players.set_index("gsis_id", drop=False)
 
-    # Draft-prep rule: a veteran candidate must have appeared in the immediately
-    # preceding season. This avoids using today's "active" status to backtest
-    # historical drafts.
-    previous = stats[stats["season"].eq(target_season - 1)]
-    candidates = (
-        previous[["player_id", "player_name", "position"]]
-        .drop_duplicates("player_id", keep="last")
+    diagnostics = {
+        "veteran_source_season": None,
+        "veteran_candidate_count": 0,
+        "veteran_samples_built": 0,
+        "veteran_metadata_matches": 0,
+        "veteran_metadata_misses": 0,
+    }
+
+    prior_seasons = sorted(
+        int(x)
+        for x in stats["season"].dropna().unique()
+        if int(x) < int(target_season)
     )
 
+    if not prior_seasons:
+        empty = pd.DataFrame()
+        empty.attrs.update(diagnostics)
+        return empty
+
+    source_season = prior_seasons[-1]
+    diagnostics["veteran_source_season"] = source_season
+
+    previous = stats[stats["season"].eq(source_season)].copy()
+
+    name_col = (
+        "player_display_name"
+        if "player_display_name" in previous.columns
+        else "player_name"
+    )
+
+    candidates = (
+        previous[["player_id", name_col, "position"]]
+        .rename(columns={name_col: "player_name"})
+        .drop_duplicates("player_id", keep="last")
+        .copy()
+    )
+    candidates["player_id"] = candidates["player_id"].map(_normalize_player_id)
+    candidates = candidates[candidates["player_id"].ne("")]
+    diagnostics["veteran_candidate_count"] = int(len(candidates))
+
+    players = players.drop_duplicates("gsis_id", keep="last")
+    player_lookup = players.set_index("gsis_id", drop=False)
+
     samples = []
+
     for row in candidates.itertuples(index=False):
-        pid = str(row.player_id)
-        if row.position not in SKILL_POSITIONS or pid not in player_lookup.index:
+        pid = _normalize_player_id(row.player_id)
+        position = str(row.position).upper()
+
+        if position not in SKILL_POSITIONS:
             continue
+
+        if pid in player_lookup.index:
+            player_row = player_lookup.loc[pid]
+            diagnostics["veteran_metadata_matches"] += 1
+        else:
+            # Sequence history is enough to project the player. Missing static
+            # metadata is filled by the fitted SimpleImputer.
+            player_row = pd.Series(
+                {
+                    "gsis_id": pid,
+                    "display_name": row.player_name,
+                    "position": position,
+                    "birth_date": pd.NaT,
+                    "rookie_season": np.nan,
+                    "draft_year": np.nan,
+                    "height": np.nan,
+                    "weight": np.nan,
+                    "draft_round": np.nan,
+                    "draft_pick": np.nan,
+                }
+            )
+            diagnostics["veteran_metadata_misses"] += 1
+
         sample = _build_inference_sample(
             pid,
             row.player_name,
-            row.position,
+            position,
             target_season,
             stats,
-            player_lookup.loc[pid],
+            player_row,
             config,
         )
         if sample is not None:
             samples.append(sample)
 
+    diagnostics["veteran_samples_built"] = int(len(samples))
+
     if not samples:
-        return pd.DataFrame()
+        empty = pd.DataFrame()
+        empty.attrs.update(diagnostics)
+        return empty
 
     ds = SequenceDataset(
         samples,
@@ -805,7 +892,10 @@ def project_veterans(
                 "model": "transformer",
             }
         )
-    return pd.DataFrame(rows)
+
+    result = pd.DataFrame(rows)
+    result.attrs.update(diagnostics)
+    return result
 
 
 def _height_to_inches(value: object) -> float:
@@ -1223,6 +1313,8 @@ def train_and_rank(
         target_season,
     )
 
+    veteran_diagnostics = dict(veteran_rankings.attrs)
+
     rankings = pd.concat(
         [veteran_rankings, rookie_rankings],
         ignore_index=True,
@@ -1233,6 +1325,7 @@ def train_and_rank(
     metrics["rookie_training_samples"] = rookie_training_samples
     metrics["ranked_veterans"] = int((~rankings["rookie"]).sum()) if not rankings.empty else 0
     metrics["ranked_rookies"] = int(rankings["rookie"].sum()) if not rankings.empty else 0
+    metrics.update(veteran_diagnostics)
 
     paths = save_artifacts(
         output_dir=output_dir,
@@ -1253,6 +1346,8 @@ def train_and_rank(
 
     return {
         "rankings": rankings,
+        "veteran_rankings": veteran_rankings,
+        "rookie_rankings": rookie_rankings,
         "metrics": metrics,
         "history": history,
         "paths": paths,
