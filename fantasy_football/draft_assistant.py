@@ -26,6 +26,8 @@ from fantasy_football.draft_engine import (
     picks_for_draft_slot,
     roster_positions_from_draft,
     score_draft_board,
+    sleeper_picks_to_roster_records,
+    assign_roster_records_to_slots,
 )
 from fantasy_football.sleeper_api import (
     extract_draft_id,
@@ -34,6 +36,18 @@ from fantasy_football.sleeper_api import (
     get_league,
     get_league_drafts,
 )
+
+
+def _ignore_recommended_player(player_name: str) -> None:
+    key = "draft_assistant_ignored_players"
+    current = list(st.session_state.get(key, []))
+    if player_name not in current:
+        current.append(player_name)
+    st.session_state[key] = current
+
+
+def _clear_ignored_players() -> None:
+    st.session_state["draft_assistant_ignored_players"] = []
 
 
 st.set_page_config(
@@ -456,75 +470,88 @@ sleeper_my_picks = picks_for_draft_slot(
     picks,
     int(user_slot),
 )
-sleeper_my_names = [
-    pick_display_name(pick)
-    for pick in sleeper_my_picks
-]
 
-# In mock-draft mode, auto-sync is much more useful than manual selection.
-default_sync = mode == "Mock Draft / Draft ID"
+sync_key = "draft_assistant_sync_roster"
+roster_widget_key = "draft_assistant_roster_widget"
+
+if sync_key not in st.session_state:
+    st.session_state[sync_key] = mode == "Mock Draft / Draft ID"
 
 sync_from_sleeper = st.checkbox(
     "Sync my roster from Sleeper picks",
-    value=default_sync,
+    key=sync_key,
     help=(
-        "Uses the picks from your selected draft slot. This is recommended "
-        "for mock drafts."
+        "Uses every pick from your selected Sleeper draft slot. "
+        "K/DEF and picks missing from the model rankings are preserved."
     ),
 )
 
-default_roster = st.session_state.get(
-    "draft_assistant_manual_roster",
-    [],
+synced_records = sleeper_picks_to_roster_records(
+    sleeper_my_picks,
+    rankings,
 )
 
-if sync_from_sleeper:
-    ranked_name_map = {
-        name.lower(): name
-        for name in all_player_names
-    }
+synced_ranked_names = [
+    record["player"]
+    for record in synced_records
+    if record.get("matched")
+    and record.get("player") in all_player_names
+]
 
-    default_roster = [
-        ranked_name_map[name.lower()]
-        for name in sleeper_my_names
-        if name.lower() in ranked_name_map
+if sync_from_sleeper:
+    # Streamlit ignores new `default=` values after a multiselect widget has
+    # already been constructed.  Updating its state before rendering makes the
+    # visible selected chips follow the refreshed Sleeper draft.
+    st.session_state[roster_widget_key] = synced_ranked_names
+elif roster_widget_key not in st.session_state:
+    st.session_state[roster_widget_key] = [
+        name
+        for name in st.session_state.get(
+            "draft_assistant_manual_roster",
+            [],
+        )
+        if name in all_player_names
     ]
 
 manual_roster = st.multiselect(
     "Your drafted players",
     options=all_player_names,
-    default=[
-        name
-        for name in default_roster
-        if name in all_player_names
-    ],
+    key=roster_widget_key,
     disabled=sync_from_sleeper,
     help=(
-        "Turn off Sleeper sync if you want to override the roster manually."
+        "With Sleeper sync enabled this mirrors matched Sleeper picks. "
+        "Turn sync off to edit the roster manually."
     ),
 )
 
 if sync_from_sleeper:
-    selected_roster = default_roster
+    roster_view, bench_records = assign_roster_records_to_slots(
+        synced_records,
+        roster_positions,
+    )
+    selected_roster = synced_ranked_names
 else:
     selected_roster = manual_roster
-    st.session_state[
-        "draft_assistant_manual_roster"
-    ] = manual_roster
+    st.session_state["draft_assistant_manual_roster"] = manual_roster
 
-roster_view, bench_players = assign_roster_to_slots(
-    rankings,
-    selected_roster,
-    roster_positions,
-)
+    roster_view, bench_names = assign_roster_to_slots(
+        rankings,
+        selected_roster,
+        roster_positions,
+    )
+    bench_records = [
+        {"player": name, "position": "", "matched": True}
+        for name in bench_names
+    ]
 
 roster_display = roster_view[
     ["slot", "player", "position", "projected_points"]
 ].copy()
 
-roster_display["projected_points"] = roster_display[
-    "projected_points"
-].round(1)
+roster_display["projected_points"] = pd.to_numeric(
+    roster_display["projected_points"],
+    errors="coerce",
+).round(1)
 
 st.dataframe(
     roster_display,
@@ -532,8 +559,60 @@ st.dataframe(
     hide_index=True,
 )
 
-if bench_players:
-    st.caption("Bench: " + ", ".join(bench_players))
+if bench_records:
+    st.caption(
+        "Bench: "
+        + ", ".join(
+            str(record.get("player"))
+            for record in bench_records
+        )
+    )
+
+if sync_from_sleeper:
+    unmatched = [
+        record
+        for record in synced_records
+        if not record.get("matched")
+    ]
+
+    sync_cols = st.columns(3)
+    sync_cols[0].metric(
+        "Sleeper picks in your slot",
+        len(sleeper_my_picks),
+    )
+    sync_cols[1].metric(
+        "Matched to projections",
+        len(synced_records) - len(unmatched),
+    )
+    sync_cols[2].metric(
+        "Unmatched / K / DEF",
+        len(unmatched),
+    )
+
+    if unmatched:
+        with st.expander("Sleeper picks without model projections"):
+            unmatched_df = pd.DataFrame(unmatched)
+            show_cols = [
+                col
+                for col in [
+                    "player",
+                    "position",
+                    "pick_no",
+                    "round",
+                    "sleeper_player_id",
+                ]
+                if col in unmatched_df.columns
+            ]
+            st.dataframe(
+                unmatched_df[show_cols],
+                use_container_width=True,
+                hide_index=True,
+            )
+
+    st.caption(
+        f"Synced {len(sleeper_my_picks)} Sleeper pick(s) from draft slot "
+        f"{int(user_slot)}."
+    )
 
 st.divider()
 
@@ -541,10 +620,33 @@ st.divider()
 # ------------------------------------------------------------------
 # Recommendation
 # ------------------------------------------------------------------
+st.markdown("#### Recommendation controls")
+
+ignore_controls_left, ignore_controls_right = st.columns([4, 1])
+
+with ignore_controls_left:
+    ignored_players = st.multiselect(
+        "Ignore players from recommendations",
+        options=all_player_names,
+        key="draft_assistant_ignored_players",
+        help=(
+            "Use this when Sleeper and the model disagree on a player identity, "
+            "or when you simply do not want the assistant to recommend someone."
+        ),
+    )
+
+with ignore_controls_right:
+    st.button(
+        "Clear ignored",
+        on_click=_clear_ignored_players,
+        use_container_width=True,
+    )
+
 available = available_players(
     rankings=rankings,
     picks=picks,
     manually_selected_roster=selected_roster,
+    ignored_players=ignored_players,
 )
 
 recommendations = score_draft_board(
@@ -553,6 +655,64 @@ recommendations = score_draft_board(
     teams=teams,
     picks_until_next_turn=picks_until_next,
 )
+
+# These diagnostics make it immediately obvious whether Refresh Live Picks
+# actually changed the recommendation pool.
+with st.expander("Recommendation refresh status"):
+    refresh_cols = st.columns(3)
+    refresh_cols[0].metric(
+        "Sleeper picks loaded",
+        int(available.attrs.get("sleeper_pick_count", len(picks))),
+    )
+    refresh_cols[1].metric(
+        "Drafted model players removed",
+        int(available.attrs.get("matched_drafted_count", 0)),
+    )
+    refresh_cols[2].metric(
+        "Unmatched Sleeper picks",
+        int(available.attrs.get("unmatched_pick_count", 0)),
+    )
+
+    refresh_cols_2 = st.columns(3)
+    refresh_cols_2[0].metric(
+        "Ignored players",
+        int(available.attrs.get("ignored_player_count", 0)),
+    )
+    refresh_cols_2[1].metric(
+        "Players still available",
+        int(available.attrs.get("remaining_player_count", len(available))),
+    )
+    refresh_cols_2[2].metric(
+        "Current overall pick",
+        int(current_pick_no),
+    )
+
+    unmatched_pick_names = available.attrs.get("unmatched_pick_names", [])
+    if unmatched_pick_names:
+        st.warning(
+            "Sleeper picks not matched to the rankings: "
+            + ", ".join(str(name) for name in unmatched_pick_names[:20])
+        )
+
+    if "sleeper_id" in rankings.columns:
+        sleeper_id_count = int(
+            rankings["sleeper_id"]
+            .fillna("")
+            .astype(str)
+            .str.strip()
+            .ne("")
+            .sum()
+        )
+        st.caption(
+            f"Rankings with a Sleeper ID: {sleeper_id_count} / {len(rankings)}"
+        )
+
+    if not recommendations.empty:
+        st.caption(
+            "Current top recommendation: "
+            f"{recommendations.iloc[0]['player']} "
+            f"({recommendations.iloc[0]['position']})"
+        )
 
 st.subheader("RECOMMENDED PICK")
 
@@ -587,6 +747,13 @@ else:
         st.markdown("**Why:**")
         for reason in top["reasons"]:
             st.markdown(f"• {reason}")
+
+    st.button(
+        f"Ignore {top['player']}",
+        on_click=_ignore_recommended_player,
+        args=(str(top["player"]),),
+        help="Remove this player from recommendations for the rest of this session.",
+    )
 
     st.markdown("#### Alternatives")
 

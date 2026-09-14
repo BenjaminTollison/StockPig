@@ -16,6 +16,11 @@ import torch
 
 from fantasy_transformer import FantasyScoring, TrainConfig, train_and_rank
 
+try:
+    from fantasy_football.sleeper_api import get_league
+except ImportError:
+    from sleeper_api import get_league
+
 
 def rank_veterans_and_rookies_together(
     result: dict,
@@ -216,16 +221,79 @@ with st.sidebar:
         step=1,
     )
 
-    scoring_name = st.selectbox(
-        "Reception scoring",
-        ["PPR", "Half PPR", "Standard"],
-        index=0,
+    st.subheader("Sleeper League")
+
+    league_id = st.text_input(
+        "Sleeper league ID",
+        value=st.session_state.get("sleeper_league_id", ""),
+        placeholder="Enter league ID",
+        help="The league supplies the scoring applied AFTER the Transformer predicts football outcomes.",
     )
-    reception_points = {
-        "PPR": 1.0,
-        "Half PPR": 0.5,
-        "Standard": 0.0,
-    }[scoring_name]
+
+    if st.button("Load Sleeper league", use_container_width=True):
+        try:
+            league = get_league(league_id)
+            st.session_state["sleeper_league"] = league
+            st.session_state["sleeper_league_id"] = str(league["league_id"])
+        except Exception as exc:
+            st.error(f"Could not load Sleeper league: {exc}")
+
+    sleeper_league = st.session_state.get("sleeper_league")
+
+    if sleeper_league:
+        scoring = FantasyScoring.from_sleeper_settings(
+            sleeper_league.get("scoring_settings", {})
+        )
+        scoring_name = f"Sleeper — {sleeper_league.get('name', 'League')}"
+
+        st.success(
+            f"Loaded: {sleeper_league.get('name', sleeper_league.get('league_id'))}"
+        )
+        st.caption(
+            f"Season: {sleeper_league.get('season', 'unknown')} · "
+            f"Teams: {sleeper_league.get('total_rosters', 'unknown')}"
+        )
+
+        st.write(
+            f"Reception scoring: **{scoring.reception:g}** points/reception"
+        )
+        st.write(
+            f"Passing TD: **{scoring.passing_td:g}** · "
+            f"INT: **{scoring.interception:g}**"
+        )
+
+        unsupported = scoring.unsupported_offensive_settings()
+        if unsupported:
+            st.warning(
+                "This league has offensive scoring rules the current model "
+                "does not support yet. Expand the section below."
+            )
+
+        with st.expander("Sleeper scoring settings"):
+            st.json(sleeper_league.get("scoring_settings", {}))
+            if unsupported:
+                st.markdown("**Not yet modeled:**")
+                st.json(unsupported)
+
+    else:
+        st.info(
+            "Load a Sleeper league to use its scoring. Until then, training "
+            "uses the manual fallback below."
+        )
+
+        fallback_scoring = st.selectbox(
+            "Fallback reception scoring",
+            ["PPR", "Half PPR", "Standard"],
+            index=0,
+        )
+        reception_points = {
+            "PPR": 1.0,
+            "Half PPR": 0.5,
+            "Standard": 0.0,
+        }[fallback_scoring]
+
+        scoring = FantasyScoring(reception=float(reception_points))
+        scoring_name = fallback_scoring
 
     sequence_length = st.slider(
         "Game-history length",
@@ -289,10 +357,8 @@ config = TrainConfig(
     epochs=int(epochs),
     batch_size=int(batch_size),
 )
-scoring = FantasyScoring(reception=float(reception_points))
-
 train_clicked = st.button(
-    "Train model & build draft rankings",
+    "Train outcome model & build draft rankings",
     type="primary",
     use_container_width=True,
 )
@@ -317,6 +383,20 @@ if train_clicked:
         st.session_state["fantasy_result"] = result
         st.session_state["fantasy_target_season"] = int(target_season)
         st.session_state["fantasy_scoring_name"] = scoring_name
+        st.session_state["fantasy_scoring"] = {
+            "reception": scoring.reception,
+            "passing_yard": scoring.passing_yard,
+            "passing_td": scoring.passing_td,
+            "interception": scoring.interception,
+            "rushing_yard": scoring.rushing_yard,
+            "rushing_td": scoring.rushing_td,
+            "receiving_yard": scoring.receiving_yard,
+            "receiving_td": scoring.receiving_td,
+            "passing_2pt": scoring.passing_2pt,
+            "rushing_2pt": scoring.rushing_2pt,
+            "receiving_2pt": scoring.receiving_2pt,
+            "fumble_lost": scoring.fumble_lost,
+        }
         status.update(label="Training complete", state="complete", expanded=False)
     except Exception as exc:
         status.update(label="Training failed", state="error", expanded=True)
@@ -338,7 +418,7 @@ if "fantasy_result" in st.session_state:
 
     m1, m2, m3, m4 = st.columns(4)
     m1.metric("Validation season", int(metrics["validation_season"]))
-    m2.metric("Validation MAE", f"{metrics['mae']:.1f} pts")
+    m2.metric("Fantasy MAE", f"{metrics['mae']:.1f} pts")
     veteran_count = int((~rankings["rookie"]).sum())
     rookie_count = int(rankings["rookie"].sum())
     m3.metric("Veterans ranked", veteran_count)
@@ -383,9 +463,9 @@ if "fantasy_result" in st.session_state:
         )
 
     st.caption(
-        "MAE is next-season total fantasy-point error on the held-out most "
-        "recent historical season. Treat these rankings as a model baseline, "
-        "not as a finished draft product."
+        "The Transformer is trained on football outcomes, not fantasy points. "
+        "Fantasy MAE is shown only as a downstream validation metric after the "
+        "selected Sleeper scoring is applied."
     )
 
     display_cols = [
@@ -426,10 +506,52 @@ if "fantasy_result" in st.session_state:
         mime="text/csv",
     )
 
+    with st.expander("Player Outcome Distributions"):
+        outcomes = result.get("outcomes")
+        if isinstance(outcomes, pd.DataFrame) and not outcomes.empty:
+            player_options = outcomes["player"].dropna().astype(str).sort_values().tolist()
+            selected_player = st.selectbox(
+                "Inspect player",
+                player_options,
+                key="outcome_distribution_player",
+            )
+            player_row = outcomes[outcomes["player"].eq(selected_player)].iloc[0]
+
+            outcome_rows = []
+            for column in outcomes.columns:
+                if not column.startswith("mean_"):
+                    continue
+                outcome = column.removeprefix("mean_")
+                std_column = f"std_{outcome}"
+                outcome_rows.append(
+                    {
+                        "outcome": outcome,
+                        "mean": float(player_row[column]),
+                        "std": float(player_row.get(std_column, 0.0)),
+                    }
+                )
+
+            st.dataframe(
+                pd.DataFrame(outcome_rows).round(2),
+                use_container_width=True,
+                hide_index=True,
+            )
+            st.caption(
+                "These are scoring-independent season outcome marginals. "
+                "The draft-board fantasy projection is calculated afterward "
+                "from the league scoring settings."
+            )
+        else:
+            st.caption("No outcome distribution table is available.")
+
     with st.expander("Training history"):
-        st.line_chart(
-            history.set_index("epoch")[["val_mae", "val_rmse"]]
-        )
+        chart_cols = [
+            col
+            for col in ["val_outcome_mae", "val_fantasy_mae", "val_fantasy_rmse"]
+            if col in history.columns
+        ]
+        if chart_cols:
+            st.line_chart(history.set_index("epoch")[chart_cols])
         st.dataframe(history, use_container_width=True, hide_index=True)
 
     with st.expander("Saved model files"):
@@ -446,14 +568,19 @@ else:
 st.divider()
 st.markdown(
     """
-### What this first version is doing
+### Player Outcome Distribution architecture
 
-**Veterans:** weekly NFL stats → Transformer → projected next-season fantasy points.
+**Veterans:** weekly NFL football history → Transformer → next-season distributions
+for passing, rushing, receiving, turnovers, and games played.
 
-**Rookies:** draft capital + combine + size + position → historical rookie model
-→ projected rookie-season fantasy points.
+**Rookies:** draft capital + combine + size + position → rookie outcome priors using
+the exact same football-outcome schema.
 
-**Draft board:** veteran and rookie projections are merged first, then one shared
+**Fantasy Projection Engine:** the selected Sleeper scoring settings are applied only
+after the football outcomes are predicted. This means the Transformer itself is no
+longer tied to PPR, half-PPR, passing-TD settings, or other league scoring.
+
+**Draft board:** veteran and rookie fantasy projections are merged, then one shared
 position-specific replacement baseline and VORP ranking is calculated.
 """
 )

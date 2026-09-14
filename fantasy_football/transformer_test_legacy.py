@@ -14,7 +14,7 @@ import pandas as pd
 import streamlit as st
 import torch
 
-from fantasy_transformer import FantasyScoring, TrainConfig, train_and_rank
+from fantasy_transformer_legacy import FantasyScoring, TrainConfig, train_and_rank
 
 try:
     from fantasy_football.sleeper_api import get_league

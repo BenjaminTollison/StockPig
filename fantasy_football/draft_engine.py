@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import math
 import re
+import unicodedata
 from typing import Iterable
 
 import numpy as np
@@ -30,6 +31,9 @@ SLOT_ELIGIBILITY = {
     "RB": {"RB"},
     "WR": {"WR"},
     "TE": {"TE"},
+    "K": {"K"},
+    "DEF": {"DEF"},
+    "DST": {"DEF"},
     "FLEX": {"RB", "WR", "TE"},
     "WRRB_FLEX": {"WR", "RB"},
     "REC_FLEX": {"WR", "TE"},
@@ -38,8 +42,37 @@ SLOT_ELIGIBILITY = {
 
 
 def normalize_name(value: object) -> str:
+    """Normalize names across Sleeper/nflverse punctuation and accents."""
     value = "" if value is None else str(value)
+    value = unicodedata.normalize("NFKD", value)
+    value = "".join(ch for ch in value if not unicodedata.combining(ch))
     return re.sub(r"[^a-z0-9]", "", value.lower())
+
+
+def normalize_sleeper_id(value: object) -> str:
+    """
+    Normalize Sleeper IDs read from JSON or CSV.
+
+    A common failure mode is the same ID appearing as ``1234`` from Sleeper
+    and ``1234.0`` after pandas inferred a CSV column as float.
+    """
+    if value is None:
+        return ""
+
+    try:
+        if pd.isna(value):
+            return ""
+    except (TypeError, ValueError):
+        pass
+
+    text = str(value).strip()
+    if not text or text.lower() in {"nan", "none", "null"}:
+        return ""
+
+    if re.fullmatch(r"\d+\.0+", text):
+        text = text.split(".", 1)[0]
+
+    return text
 
 
 def normalize_rankings(rankings: pd.DataFrame) -> pd.DataFrame:
@@ -60,6 +93,16 @@ def normalize_rankings(rankings: pd.DataFrame) -> pd.DataFrame:
     df["player"] = df["player"].astype(str)
     df["player_key"] = df["player"].map(normalize_name)
     df["position"] = df["position"].astype(str).str.upper()
+
+    # Accept a few historical column names, but expose one canonical field.
+    if "sleeper_id" not in df.columns:
+        for candidate in ("sleeper_player_id", "sleeper", "sleeperId"):
+            if candidate in df.columns:
+                df["sleeper_id"] = df[candidate]
+                break
+
+    if "sleeper_id" in df.columns:
+        df["sleeper_id"] = df["sleeper_id"].map(normalize_sleeper_id)
 
     for column in [
         "projected_points",
@@ -280,9 +323,9 @@ def drafted_player_keys(picks: list[dict]) -> tuple[set[str], set[str]]:
     names: set[str] = set()
 
     for pick in picks:
-        player_id = pick.get("player_id")
+        player_id = normalize_sleeper_id(pick.get("player_id"))
         if player_id:
-            ids.add(str(player_id))
+            ids.add(player_id)
 
         metadata = pick.get("metadata") or {}
         first = str(metadata.get("first_name") or "").strip()
@@ -299,26 +342,308 @@ def available_players(
     rankings: pd.DataFrame,
     picks: list[dict],
     manually_selected_roster: list[str] | None = None,
+    ignored_players: list[str] | None = None,
 ) -> pd.DataFrame:
-    """Remove players already drafted in Sleeper or manually placed on roster."""
+    """
+    Remove drafted, manually rostered, and explicitly ignored players.
+
+    Sleeper identities are resolved with the same matcher used by roster sync.
+    """
     df = normalize_rankings(rankings)
     if df.empty:
         return df
 
-    picked_ids, picked_names = drafted_player_keys(picks)
+    drafted_player_names: set[str] = set()
+    drafted_sleeper_ids: set[str] = set()
+    unmatched_picks: list[str] = []
 
-    drafted_mask = df["player_key"].isin(picked_names)
+    for pick in picks:
+        player_id = normalize_sleeper_id(pick.get("player_id"))
+        if player_id:
+            drafted_sleeper_ids.add(player_id)
+
+        matched = match_pick_to_ranking(pick, df)
+        if matched:
+            drafted_player_names.add(str(matched["player"]))
+        else:
+            unmatched_picks.append(sleeper_pick_name(pick))
+
+    drafted_mask = df["player"].isin(drafted_player_names)
 
     if "sleeper_id" in df.columns:
-        sleeper_ids = df["sleeper_id"].astype(str)
-        drafted_mask = drafted_mask | sleeper_ids.isin(picked_ids)
+        sleeper_ids = df["sleeper_id"].map(normalize_sleeper_id)
+        drafted_mask = drafted_mask | sleeper_ids.isin(drafted_sleeper_ids)
 
     manual = set(manually_selected_roster or [])
     if manual:
         drafted_mask = drafted_mask | df["player"].isin(manual)
 
-    return df.loc[~drafted_mask].copy().reset_index(drop=True)
+    ignored = set(ignored_players or [])
+    if ignored:
+        ignored_keys = {normalize_name(name) for name in ignored}
+        drafted_mask = drafted_mask | df["player"].isin(ignored)
+        drafted_mask = drafted_mask | df["player_key"].isin(ignored_keys)
 
+    available = df.loc[~drafted_mask].copy().reset_index(drop=True)
+
+    available.attrs["sleeper_pick_count"] = len(picks)
+    available.attrs["matched_drafted_count"] = len(drafted_player_names)
+    available.attrs["unmatched_pick_count"] = len(unmatched_picks)
+    available.attrs["unmatched_pick_names"] = unmatched_picks
+    available.attrs["ignored_player_count"] = len(ignored)
+    available.attrs["remaining_player_count"] = len(available)
+
+    return available
+
+
+
+def _name_variants(value: object) -> set[str]:
+    """Return normalized cross-source name variants, including suffix removal."""
+    normalized = normalize_name(value)
+    if not normalized:
+        return set()
+
+    variants = {normalized}
+    for suffix in ("jr", "sr", "ii", "iii", "iv", "v"):
+        if normalized.endswith(suffix) and len(normalized) > len(suffix) + 2:
+            variants.add(normalized[: -len(suffix)])
+
+    return variants
+
+
+def sleeper_pick_name(pick: dict) -> str:
+    """Best human-readable name available on a Sleeper draft pick."""
+    metadata = pick.get("metadata") or {}
+
+    first = str(metadata.get("first_name") or "").strip()
+    last = str(metadata.get("last_name") or "").strip()
+    full = f"{first} {last}".strip()
+
+    if full:
+        return full
+
+    for key in ("full_name", "player_name"):
+        value = str(metadata.get(key) or "").strip()
+        if value:
+            return value
+
+    position = str(metadata.get("position") or "").upper()
+    team = str(metadata.get("team") or "").upper()
+
+    if position in {"DEF", "DST"} and team:
+        return f"{team} DEF"
+
+    return str(pick.get("player_id") or "Unknown player")
+
+
+def sleeper_pick_position(pick: dict) -> str:
+    metadata = pick.get("metadata") or {}
+    position = str(metadata.get("position") or "").upper()
+    return "DEF" if position == "DST" else position
+
+
+def match_pick_to_ranking(
+    pick: dict,
+    rankings: pd.DataFrame,
+) -> dict | None:
+    """
+    Match one Sleeper pick to one model ranking.
+
+    Priority:
+      1. sleeper_id
+      2. normalized full-name variants
+      3. unique first-initial + last-name fallback
+    """
+    df = normalize_rankings(rankings)
+    if df.empty:
+        return None
+
+    sleeper_id = normalize_sleeper_id(pick.get("player_id"))
+
+    if sleeper_id and "sleeper_id" in df.columns:
+        ids = df["sleeper_id"].map(normalize_sleeper_id)
+        matched = df.loc[ids.eq(sleeper_id)]
+        if len(matched) == 1:
+            return matched.iloc[0].to_dict()
+
+    pick_name = sleeper_pick_name(pick)
+    pick_variants = _name_variants(pick_name)
+
+    if pick_variants:
+        mask = df["player"].map(
+            lambda value: bool(_name_variants(value) & pick_variants)
+        )
+        matched = df.loc[mask]
+
+        if len(matched) == 1:
+            return matched.iloc[0].to_dict()
+
+    metadata = pick.get("metadata") or {}
+    first = str(metadata.get("first_name") or "").strip()
+    last = str(metadata.get("last_name") or "").strip()
+
+    if first and last:
+        first_initial = normalize_name(first)[:1]
+        last_key = normalize_name(last)
+        candidates = []
+
+        for _, row in df.iterrows():
+            tokens = re.findall(r"[A-Za-z0-9]+", str(row["player"]))
+            if len(tokens) < 2:
+                continue
+
+            row_first = normalize_name(tokens[0])[:1]
+            row_last = normalize_name(tokens[-1])
+
+            if row_last in {"jr", "sr", "ii", "iii", "iv", "v"} and len(tokens) >= 3:
+                row_last = normalize_name(tokens[-2])
+
+            if row_first == first_initial and row_last == last_key:
+                candidates.append(row)
+
+        if len(candidates) == 1:
+            return candidates[0].to_dict()
+
+    # Last-resort name match: require the same position and a very high
+    # SequenceMatcher score. This catches small spelling/display differences
+    # without broadly fuzzy-matching unrelated players.
+    try:
+        from difflib import SequenceMatcher
+
+        pick_position = sleeper_pick_position(pick)
+        pick_key = normalize_name(pick_name)
+        if pick_key:
+            candidates = df
+            if pick_position:
+                same_pos = df[df["position"].eq(pick_position)]
+                if not same_pos.empty:
+                    candidates = same_pos
+
+            scored = []
+            for _, row in candidates.iterrows():
+                candidate_key = normalize_name(row["player"])
+                if not candidate_key:
+                    continue
+                score = SequenceMatcher(None, pick_key, candidate_key).ratio()
+                if score >= 0.93:
+                    scored.append((score, row))
+
+            scored.sort(key=lambda item: item[0], reverse=True)
+            if scored and (len(scored) == 1 or scored[0][0] > scored[1][0] + 0.03):
+                return scored[0][1].to_dict()
+    except Exception:
+        pass
+
+    return None
+
+
+def sleeper_picks_to_roster_records(
+    picks: list[dict],
+    rankings: pd.DataFrame,
+) -> list[dict]:
+    """
+    Convert Sleeper picks into roster records without dropping unmatched picks.
+    """
+    records: list[dict] = []
+
+    for pick in sorted(
+        picks,
+        key=lambda item: int(item.get("pick_no") or 0),
+    ):
+        matched = match_pick_to_ranking(pick, rankings)
+        sleeper_position = sleeper_pick_position(pick)
+        sleeper_name = sleeper_pick_name(pick)
+
+        if matched:
+            records.append(
+                {
+                    "player": str(matched["player"]),
+                    "position": str(
+                        matched.get("position") or sleeper_position
+                    ).upper(),
+                    "projected_points": matched.get("projected_points", np.nan),
+                    "matched": True,
+                    "sleeper_player_id": str(pick.get("player_id") or ""),
+                    "pick_no": pick.get("pick_no"),
+                    "round": pick.get("round"),
+                }
+            )
+        else:
+            records.append(
+                {
+                    "player": sleeper_name,
+                    "position": sleeper_position,
+                    "projected_points": np.nan,
+                    "matched": False,
+                    "sleeper_player_id": str(pick.get("player_id") or ""),
+                    "pick_no": pick.get("pick_no"),
+                    "round": pick.get("round"),
+                }
+            )
+
+    return records
+
+
+def assign_roster_records_to_slots(
+    records: list[dict],
+    roster_positions: Iterable[str],
+) -> tuple[pd.DataFrame, list[dict]]:
+    """
+    Assign Sleeper roster records to starter slots while preserving K/DEF and
+    players not present in the model rankings.
+    """
+    slots = starter_slot_labels(list(roster_positions))
+    unassigned = [dict(record) for record in records]
+
+    base_indices = [
+        idx
+        for idx, slot in enumerate(slots)
+        if slot["slot"] in {"QB", "RB", "WR", "TE", "K", "DEF"}
+    ]
+    flex_indices = [
+        idx
+        for idx, slot in enumerate(slots)
+        if idx not in base_indices
+    ]
+
+    assigned_by_index: dict[int, dict | None] = {}
+
+    for idx in base_indices + flex_indices:
+        slot = slots[idx]
+        chosen_index = None
+
+        for record_idx, record in enumerate(unassigned):
+            position = str(record.get("position") or "").upper()
+            if position in slot["eligible"]:
+                chosen_index = record_idx
+                break
+
+        chosen = None
+        if chosen_index is not None:
+            chosen = unassigned.pop(chosen_index)
+
+        assigned_by_index[idx] = chosen
+
+    rows = []
+    for idx, slot in enumerate(slots):
+        record = assigned_by_index.get(idx)
+        rows.append(
+            {
+                "slot": slot["label"],
+                "slot_type": slot["slot"],
+                "player": record["player"] if record else "—",
+                "position": record.get("position", "") if record else "",
+                "projected_points": (
+                    record.get("projected_points", np.nan)
+                    if record
+                    else np.nan
+                ),
+                "filled": record is not None,
+                "matched": bool(record.get("matched")) if record else False,
+            }
+        )
+
+    return pd.DataFrame(rows), unassigned
 
 def pick_position_for_overall(
     pick_no: int,

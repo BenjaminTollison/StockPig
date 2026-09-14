@@ -147,3 +147,74 @@ Connect Sleeper and draft against the actual league
 Phase 7
 Reuse the same model for weekly lineup /
 waiver / trade optimization
+
+
+
+NEW ARCH
+
+                  ┌─────────────────────┐
+                  │   SportsDataverse   │
+                  │    / nflverse       │
+                  └─────────┬───────────┘
+                            │
+                    Historical NFL data
+                            │
+                            ▼
+                  ┌─────────────────────┐
+                  │ Feature Engineering │
+                  └─────────┬───────────┘
+                            │
+                            ▼
+                  ┌─────────────────────┐
+                  │ Transformer Encoder │
+                  │                     │
+                  │ Current player      │
+                  │ state / ability     │
+                  └─────────┬───────────┘
+                            │
+                   ┌────────┴────────┐
+                   │ Matchup Context │
+                   │ Opponent        │
+                   │ Schedule        │
+                   │ Team context    │
+                   └────────┬────────┘
+                            │
+                            ▼
+                 ┌──────────────────────┐
+                 │ Outcome Heads        │
+                 │                      │
+                 │ Yards distributions  │
+                 │ Volume distributions │
+                 │ TD probabilities     │
+                 │ Turnover probability │
+                 └──────────┬───────────┘
+                            │
+                            ▼
+                 PLAYER OUTCOME DISTRIBUTIONS
+                            │
+            ┌───────────────┴───────────────┐
+            │                               │
+            ▼                               ▼
+     Sleeper Scoring                 League Rules
+     State / Rosters                 Roster format
+            │                               │
+            └───────────────┬───────────────┘
+                            ▼
+                  ┌─────────────────────┐
+                  │ Fantasy Projection  │
+                  │       Engine        │
+                  └─────────┬───────────┘
+                            │
+             Fantasy point distributions
+                            │
+          ┌─────────────────┼──────────────────┐
+          ▼                 ▼                  ▼
+       Lineup            Waivers             Trades
+      Optimizer          Optimizer           Optimizer
+          │                 │                  │
+          └─────────────────┼──────────────────┘
+                            ▼
+                  Monte Carlo Simulator
+                            │
+                            ▼
+                 BEST EXPECTED PLAN
