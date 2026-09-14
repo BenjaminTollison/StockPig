@@ -190,16 +190,28 @@ NEW ARCH
                  └──────────┬───────────┘
                             │
                             ▼
-                 PLAYER OUTCOME DISTRIBUTIONS
+              PLAYER OUTCOME DISTRIBUTIONS
                             │
-            ┌───────────────┴───────────────┐
-            │                               │
-            ▼                               ▼
-     Sleeper Scoring                 League Rules
-     State / Rosters                 Roster format
-            │                               │
-            └───────────────┬───────────────┘
                             ▼
+                     Sleeper Scoring
+                            │
+                            ▼
+              FANTASY POINT DISTRIBUTIONS
+                            │
+                            │
+                    ┌───────┴─────────┐
+                    │                 │
+                    ▼                 ▼
+              League Rules        League State
+              roster slots        my roster
+              teams               opponents
+              superflex           free agents
+              bench               waivers
+              playoffs            standings
+                    │                 │
+                    └────────┬────────┘
+                             ▼
+                      VALUE / DECISION
                   ┌─────────────────────┐
                   │ Fantasy Projection  │
                   │       Engine        │
