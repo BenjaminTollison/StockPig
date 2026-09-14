@@ -566,11 +566,15 @@ def _fit_scalers(train_samples: list[PreparedSample]):
 
 
 @torch.no_grad()
+@torch.no_grad()
 def evaluate_model(
     model: FantasyTransformer,
     loader: DataLoader,
     device: torch.device,
+    target_mean: float,
+    target_std: float,
 ) -> dict[str, float]:
+    """Evaluate veteran projections in real fantasy-point units."""
     model.eval()
     actual, pred = [], []
 
@@ -581,9 +585,11 @@ def evaluate_model(
         mask = batch["padding_mask"].to(device)
         y = batch["target"].to(device)
 
-        mean, _ = model(seq, pos, static, mask)
+        mean_scaled, _ = model(seq, pos, static, mask)
+        mean_points = mean_scaled * target_std + target_mean
+
         actual.extend(y.cpu().numpy().tolist())
-        pred.extend(mean.cpu().numpy().tolist())
+        pred.extend(mean_points.cpu().numpy().tolist())
 
     if not actual:
         return {"mae": float("nan"), "rmse": float("nan")}
@@ -611,6 +617,16 @@ def train_transformer(
     val_samples = [s for s in samples if s.target_season == validation_season]
 
     seq_scaler, static_imputer, static_scaler = _fit_scalers(train_samples)
+
+    # Put season fantasy-point targets onto a stable training scale.
+    target_values = np.array(
+        [s.target_points for s in train_samples],
+        dtype=np.float32,
+    )
+    target_mean = float(target_values.mean())
+    target_std = float(target_values.std())
+    if target_std < 1e-6:
+        target_std = 1.0
 
     train_ds = SequenceDataset(
         train_samples,
@@ -661,17 +677,29 @@ def train_transformer(
             pos = batch["position"].to(device)
             static = batch["static"].to(device)
             mask = batch["padding_mask"].to(device)
-            target = batch["target"].to(device)
+            target_points = batch["target"].to(device)
+
+            target_scaled = (target_points - target_mean) / target_std
 
             optimizer.zero_grad(set_to_none=True)
-            mean, log_std = model(seq, pos, static, mask)
-            loss = gaussian_nll(mean, log_std, target)
+            mean_scaled, log_std_scaled = model(seq, pos, static, mask)
+            loss = gaussian_nll(
+                mean_scaled,
+                log_std_scaled,
+                target_scaled,
+            )
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
             epoch_losses.append(float(loss.item()))
 
-        val_metrics = evaluate_model(model, val_loader, device)
+        val_metrics = evaluate_model(
+            model,
+            val_loader,
+            device,
+            target_mean,
+            target_std,
+        )
         history.append(
             {
                 "epoch": epoch,
@@ -697,17 +725,27 @@ def train_transformer(
     if best_state is not None:
         model.load_state_dict(best_state)
 
-    final_metrics = evaluate_model(model, val_loader, device)
+    final_metrics = evaluate_model(
+        model,
+        val_loader,
+        device,
+        target_mean,
+        target_std,
+    )
     final_metrics["validation_season"] = validation_season
     final_metrics["train_samples"] = len(train_samples)
     final_metrics["validation_samples"] = len(val_samples)
     final_metrics["device"] = str(device)
+    final_metrics["veteran_target_mean"] = target_mean
+    final_metrics["veteran_target_std"] = target_std
 
     return (
         model,
         seq_scaler,
         static_imputer,
         static_scaler,
+        target_mean,
+        target_std,
         final_metrics,
         pd.DataFrame(history),
     )
@@ -752,6 +790,8 @@ def project_veterans(
     seq_scaler: StandardScaler,
     static_imputer: SimpleImputer,
     static_scaler: StandardScaler,
+    target_mean: float,
+    target_std: float,
 ) -> pd.DataFrame:
     """
     Project veteran players for target_season.
@@ -870,14 +910,18 @@ def project_veterans(
 
     model.eval()
     for batch in loader:
-        mean, log_std = model(
+        mean_scaled, log_std_scaled = model(
             batch["sequence"].to(device),
             batch["position"].to(device),
             batch["static"].to(device),
             batch["padding_mask"].to(device),
         )
-        means.extend(mean.cpu().numpy())
-        stds.extend(torch.exp(log_std).cpu().numpy())
+
+        mean_points = mean_scaled * target_std + target_mean
+        std_points = torch.exp(log_std_scaled) * target_std
+
+        means.extend(mean_points.cpu().numpy())
+        stds.extend(std_points.cpu().numpy())
 
     rows = []
     for sample, mean, std in zip(samples, means, stds):
@@ -1279,6 +1323,8 @@ def train_and_rank(
         seq_scaler,
         static_imputer,
         static_scaler,
+        target_mean,
+        target_std,
         metrics,
         history,
     ) = train_transformer(samples, config, progress=progress)
@@ -1295,6 +1341,8 @@ def train_and_rank(
         seq_scaler=seq_scaler,
         static_imputer=static_imputer,
         static_scaler=static_scaler,
+        target_mean=target_mean,
+        target_std=target_std,
     )
 
     if progress:

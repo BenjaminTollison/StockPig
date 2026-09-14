@@ -12,6 +12,7 @@ from datetime import datetime
 import numpy as np
 import pandas as pd
 import streamlit as st
+import torch
 
 from fantasy_transformer import FantasyScoring, TrainConfig, train_and_rank
 
@@ -155,6 +156,34 @@ def rank_veterans_and_rookies_together(
     return board
 
 
+def get_device_info():
+    if torch.cuda.is_available():
+        device_index = torch.cuda.current_device()
+        properties = torch.cuda.get_device_properties(device_index)
+
+        return {
+            "type": "CUDA",
+            "device": f"cuda:{device_index}",
+            "name": torch.cuda.get_device_name(device_index),
+            "device_count": torch.cuda.device_count(),
+            "cuda_version": torch.version.cuda,
+            "memory_gb": properties.total_memory / (1024 ** 3),
+        }
+
+    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        return {
+            "type": "MPS",
+            "device": "mps",
+            "name": "Apple Metal Performance Shaders",
+        }
+
+    return {
+        "type": "CPU",
+        "device": "cpu",
+        "name": "CPU",
+    }
+
+
 st.set_page_config(
     page_title="NFL Fantasy Transformer",
     page_icon="🏈",
@@ -220,6 +249,30 @@ with st.sidebar:
         options=[32, 64, 128, 256],
         value=128,
     )
+
+    st.divider()
+    st.subheader("Compute Device")
+
+    device_info = get_device_info()
+
+    if device_info["type"] == "CUDA":
+        st.success(f"GPU: {device_info['name']}")
+
+        st.write(f"**PyTorch device:** `{device_info['device']}`")
+        st.write(f"**CUDA version:** `{device_info['cuda_version']}`")
+        st.write(f"**CUDA GPUs found:** {device_info['device_count']}")
+        st.write(
+            f"**VRAM:** {device_info['memory_gb']:.1f} GB"
+        )
+
+    elif device_info["type"] == "MPS":
+        st.info("Using Apple GPU / MPS")
+        st.write(f"**Device:** `{device_info['device']}`")
+
+    else:
+        st.warning("CUDA not available — using CPU")
+        st.write("**Device:** `cpu`")
+
 
     st.divider()
     st.caption(
@@ -388,6 +441,8 @@ else:
         "**Train model & build draft rankings**."
     )
 
+
+
 st.divider()
 st.markdown(
     """
@@ -400,8 +455,5 @@ st.markdown(
 
 **Draft board:** veteran and rookie projections are merged first, then one shared
 position-specific replacement baseline and VORP ranking is calculated.
-
-The next major upgrade should add college production to the rookie model and
-then backtest the rankings season-by-season before connecting Sleeper.
 """
 )
