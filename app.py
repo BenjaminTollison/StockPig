@@ -44,9 +44,13 @@ pages = {
     ],
     "NFL Fantasy": [
         st.Page(
-            "fantasy_football/transformer_test.py",
+            "fantasy_football/transformer_test(3).py",
             title="Transformer Test",
             icon="🎯",
+        ),
+        st.Page(
+            "fantasy_football/draft_assistant.py",
+            title="Draft Assistant",
         ),
     ],
 }

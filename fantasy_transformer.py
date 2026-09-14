@@ -20,7 +20,7 @@ import json
 import math
 import random
 import re
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -97,7 +97,12 @@ ROOKIE_NUMERIC_FEATURES = [
 
 @dataclass
 class FantasyScoring:
-    """Basic scoring settings. Later these can be filled from Sleeper."""
+    """
+    Offensive fantasy scoring used by the projection model.
+
+    Sleeper names its scoring fields differently from SportsDataverse, so this
+    object is the translation layer between the league and the model.
+    """
     reception: float = 1.0
     passing_yard: float = 0.04
     passing_td: float = 4.0
@@ -106,8 +111,93 @@ class FantasyScoring:
     rushing_td: float = 6.0
     receiving_yard: float = 0.10
     receiving_td: float = 6.0
-    two_point_conversion: float = 2.0
+    passing_2pt: float = 2.0
+    rushing_2pt: float = 2.0
+    receiving_2pt: float = 2.0
     fumble_lost: float = -2.0
+
+    # Retain the original Sleeper settings so the UI can display them and so
+    # unsupported custom scoring can be detected instead of silently ignored.
+    raw_sleeper_settings: dict[str, float] = field(
+        default_factory=dict,
+        repr=False,
+    )
+
+    @classmethod
+    def from_sleeper_settings(
+        cls,
+        settings: dict | None,
+    ) -> "FantasyScoring":
+        """Create model scoring directly from league['scoring_settings']."""
+        settings = settings or {}
+
+        def value(key: str, default: float) -> float:
+            raw = settings.get(key, default)
+            try:
+                return float(raw)
+            except (TypeError, ValueError):
+                return float(default)
+
+        return cls(
+            reception=value("rec", 1.0),
+            passing_yard=value("pass_yd", 0.04),
+            passing_td=value("pass_td", 4.0),
+            interception=value("pass_int", -2.0),
+            rushing_yard=value("rush_yd", 0.10),
+            rushing_td=value("rush_td", 6.0),
+            receiving_yard=value("rec_yd", 0.10),
+            receiving_td=value("rec_td", 6.0),
+            passing_2pt=value("pass_2pt", 2.0),
+            rushing_2pt=value("rush_2pt", 2.0),
+            receiving_2pt=value("rec_2pt", 2.0),
+            fumble_lost=value("fum_lost", -2.0),
+            raw_sleeper_settings={
+                str(k): float(v)
+                for k, v in settings.items()
+                if isinstance(v, (int, float))
+            },
+        )
+
+    def unsupported_offensive_settings(self) -> dict[str, float]:
+        """
+        Return non-zero Sleeper offensive settings that this MVP does not yet
+        include in add_fantasy_points().
+
+        This is especially useful for TE premium, first-down scoring, long-play
+        bonuses, completion scoring, etc.
+        """
+        supported = {
+            "rec",
+            "pass_yd",
+            "pass_td",
+            "pass_int",
+            "rush_yd",
+            "rush_td",
+            "rec_yd",
+            "rec_td",
+            "pass_2pt",
+            "rush_2pt",
+            "rec_2pt",
+            "fum_lost",
+        }
+
+        offensive_prefixes = (
+            "pass_",
+            "rush_",
+            "rec_",
+            "bonus_pass",
+            "bonus_rush",
+            "bonus_rec",
+            "fum",
+        )
+
+        return {
+            key: value
+            for key, value in self.raw_sleeper_settings.items()
+            if key not in supported
+            and value != 0
+            and key.startswith(offensive_prefixes)
+        }
 
 
 @dataclass
@@ -207,12 +297,6 @@ def add_fantasy_points(stats: pd.DataFrame, scoring: FantasyScoring) -> pd.DataF
         + x["receiving_fumbles_lost"]
     )
 
-    two_pt = (
-        x["passing_2pt_conversions"]
-        + x["rushing_2pt_conversions"]
-        + x["receiving_2pt_conversions"]
-    )
-
     stats["fantasy_points_model"] = (
         x["passing_yards"] * scoring.passing_yard
         + x["passing_tds"] * scoring.passing_td
@@ -222,7 +306,9 @@ def add_fantasy_points(stats: pd.DataFrame, scoring: FantasyScoring) -> pd.DataF
         + x["receptions"] * scoring.reception
         + x["receiving_yards"] * scoring.receiving_yard
         + x["receiving_tds"] * scoring.receiving_td
-        + two_pt * scoring.two_point_conversion
+        + x["passing_2pt_conversions"] * scoring.passing_2pt
+        + x["rushing_2pt_conversions"] * scoring.rushing_2pt
+        + x["receiving_2pt_conversions"] * scoring.receiving_2pt
         + fumbles_lost * scoring.fumble_lost
     )
     return stats
