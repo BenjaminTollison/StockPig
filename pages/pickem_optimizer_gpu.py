@@ -3,6 +3,7 @@ from __future__ import annotations
 from functools import lru_cache
 from itertools import combinations
 import math
+import gc
 
 import numpy as np
 import pandas as pd
@@ -573,6 +574,22 @@ if remaining_teams < remaining_slots:
     )
     st.stop()
 
+# Older versions retained complete RandomForestRegressor bundles in
+# session_state. Drop them immediately when this version is loaded.
+legacy_model_cache = st.session_state.pop("_pickem_model_cache", None)
+legacy_result = st.session_state.get("_pickem_result")
+if isinstance(legacy_result, dict) and "bundle" in legacy_result:
+    st.session_state.pop("_pickem_result", None)
+if legacy_model_cache is not None:
+    del legacy_model_cache
+gc.collect()
+try:
+    if predictor.torch is not None and predictor.torch.cuda.is_available():
+        predictor.torch.cuda.empty_cache()
+except Exception:
+    pass
+
+
 run_key = (
     int(season),
     int(planning_start_week),
@@ -606,57 +623,24 @@ if execute:
             int(season),
         )
 
-    # Historical feature rows are expensive. Build them once per model setup,
-    # then keep the completed DataFrame in session_state.
-    historical_key = (
-        TRAIN_START_SEASON,
-        int(season),
-        int(planning_start_week),
-        int(lookback_games),
-    )
-
-    historical_cache = st.session_state.setdefault(
-        "_pickem_historical_cache",
-        {},
-    )
-
-    if historical_key in historical_cache:
-        training_rows = historical_cache[
-            historical_key
-        ].copy()
-
-        data_progress.progress(
-            100,
-            text=(
-                f"Historical training data loaded from session cache • "
-                f"{len(training_rows):,} rows"
-            ),
-        )
-    else:
-        training_rows = predictor.build_historical_training_rows(
+    training_rows, feature_store_path, appended_feature_rows = (
+        predictor.load_incremental_historical_features(
             first_training_season=TRAIN_START_SEASON,
             target_season=int(season),
             target_week=int(planning_start_week),
             lookback_games=int(lookback_games),
             progress_callback=update_data_progress,
         )
-
-        historical_cache[
-            historical_key
-        ] = training_rows.copy()
-
-        data_progress.progress(
-            100,
-            text=(
-                f"Historical training data complete • "
-                f"{len(training_rows):,} rows"
-            ),
-        )
-
-    model_cache = st.session_state.setdefault(
-        "_pickem_model_cache",
-        {},
     )
+
+    data_progress.progress(
+        100,
+        text=(
+            f"Historical features ready • {len(training_rows):,} rows • "
+            f"{appended_feature_rows:,} new rows persisted"
+        ),
+    )
+    st.caption(f"Persistent feature store: `{feature_store_path}`")
 
     model_progress = st.progress(
         0,
@@ -669,21 +653,28 @@ if execute:
             text=message,
         )
 
-    if historical_key in model_cache:
-        bundle = model_cache[historical_key]
-        model_progress.progress(
-            100,
-            text=(
-                f"Trained model loaded from session cache • "
-                f"MAE {bundle.mae:.2f} pts"
-            ),
-        )
-    else:
-        bundle = predictor.train_and_validate_model(
-            training_rows,
-            progress_callback=update_model_progress,
-        )
-        model_cache[historical_key] = bundle
+    # Train only for this explicit optimization request. The completed
+    # RandomForestRegressor is never stored in session_state.
+    bundle = predictor.train_and_validate_model(
+        training_rows,
+        progress_callback=update_model_progress,
+    )
+
+    model_progress.progress(
+        100,
+        text=(
+            f"Model ready • MAE {bundle.mae:.2f} pts • "
+            "forest will be released after probabilities are generated"
+        ),
+    )
+
+    validation_metrics = {
+        "mae": float(bundle.mae),
+        "rmse": float(bundle.rmse),
+        "r2": float(bundle.r2),
+        "validation_rows": int(bundle.validation_rows),
+    }
+    training_rows_count = int(len(training_rows))
 
     probability_progress = st.progress(
         0,
@@ -729,28 +720,51 @@ if execute:
             probabilities,
         )
 
+        # Persist only the small outputs needed to redraw the page. The
+        # Random Forest, historical training frame, raw PBP, and schedule are
+        # deliberately excluded.
         st.session_state["_pickem_result"] = {
             "key": run_key,
-            "historical_key": historical_key,
-            "bundle": bundle,
             "probabilities": probabilities,
             "recommendations": recommendations,
-            "season_survival": season_survival,
-            "training_rows_count": len(training_rows),
+            "season_survival": float(season_survival),
+            "training_rows_count": training_rows_count,
+            "validation_metrics": validation_metrics,
+            "feature_store_path": str(feature_store_path),
         }
 
     except ValueError as exc:
         st.session_state.pop("_pickem_result", None)
         st.error(str(exc))
 
+    # Release the production forest, its validation data, the historical
+    # feature DataFrame, and raw SportsDataverse frames as soon as all model
+    # outputs have been materialized.
+    del bundle
+    del training_rows
+    del pbp
+    del schedule
+
+    try:
+        predictor.load_model_data.clear()
+    except Exception:
+        pass
+
+    gc.collect()
+    try:
+        if predictor.torch is not None and predictor.torch.cuda.is_available():
+            predictor.torch.cuda.empty_cache()
+    except Exception:
+        pass
+
 
 result = st.session_state.get("_pickem_result")
 
 if result is not None and result.get("key") == run_key:
-    bundle = result["bundle"]
     recommendations = result["recommendations"]
     probabilities = result["probabilities"]
     season_survival = float(result["season_survival"])
+    metrics = result["validation_metrics"]
 
     st.divider()
     st.subheader("Optimal remaining pick plan")
@@ -762,15 +776,20 @@ if result is not None and result.get("key") == run_key:
     )
     m2.metric(
         "Validation MAE",
-        f"{bundle.mae:.2f} pts",
+        f"{metrics['mae']:.2f} pts",
     )
     m3.metric(
         "Validation RMSE",
-        f"{bundle.rmse:.2f} pts",
+        f"{metrics['rmse']:.2f} pts",
     )
     m4.metric(
         "Training rows",
         f'{int(result["training_rows_count"]):,}',
+    )
+
+    st.caption(
+        f"Persistent feature store: `{result['feature_store_path']}` • "
+        "Random Forest released after probability generation"
     )
 
     st.dataframe(
@@ -857,7 +876,8 @@ This is mathematically equivalent to maximizing the product above.
 elif not execute:
     st.caption(
         "Set the already-used teams and lookback window, then click "
-        "**Execute training & optimize picks**. The expensive historical "
-        "feature data and trained model are retained in this Streamlit session "
-        "for the same settings."
+        "**Execute training & optimize picks**. Historical features are read "
+        "from the persistent Parquet store when available. The Random Forest "
+        "is trained only for the explicit optimization run and is released "
+        "immediately after the probability table is produced."
     )

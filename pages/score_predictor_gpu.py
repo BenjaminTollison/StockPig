@@ -2,8 +2,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Iterable
 
+import gc
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -778,6 +780,7 @@ def build_historical_training_rows(
     target_week: int,
     lookback_games: int,
     progress_callback=None,
+    exclude_game_ids: set[int] | None = None,
 ) -> pd.DataFrame:
     """Create two leakage-safe score rows per historical SEC-related game."""
 
@@ -816,6 +819,11 @@ def build_historical_training_rows(
     diagnostic_counts["schedule_pbp_matched_rows"] = int(len(eligible))
 
     eligible = eligible.sort_values(["season", "week", "start_date", "game_id"])
+
+    # Incremental feature-store support: games already persisted to Parquet do
+    # not need to have their historical features rebuilt.
+    if exclude_game_ids:
+        eligible = eligible[~eligible["game_id"].isin(exclude_game_ids)].copy()
 
     rows: list[dict] = []
 
@@ -976,6 +984,152 @@ def build_historical_training_rows(
     return pd.DataFrame(rows).sort_values(
         ["season", "week", "start_date", "game_id", "is_home"]
     ).reset_index(drop=True)
+
+
+# =============================================================================
+# Persistent incremental historical feature store
+# =============================================================================
+
+FEATURE_STORE_DIR = Path(__file__).resolve().parents[1] / "data" / "feature_store"
+
+
+def historical_feature_store_path(
+    first_training_season: int,
+    target_season: int,
+    lookback_games: int,
+) -> Path:
+    """One growing Parquet store per feature-definition/training window."""
+    return FEATURE_STORE_DIR / (
+        f"historical_features_{first_training_season}_{target_season}_"
+        f"lb{lookback_games}.parquet"
+    )
+
+
+def rows_before_target(
+    rows: pd.DataFrame,
+    target_season: int,
+    target_week: int,
+) -> pd.DataFrame:
+    """Return only rows that are legal training history for the target week."""
+    if rows.empty:
+        return rows.copy()
+    mask = (
+        (rows["season"] < target_season)
+        | ((rows["season"] == target_season) & (rows["week"] < target_week))
+    )
+    return rows.loc[mask].copy().sort_values(
+        ["season", "week", "start_date", "game_id", "is_home"]
+    ).reset_index(drop=True)
+
+
+def load_incremental_historical_features(
+    first_training_season: int,
+    target_season: int,
+    target_week: int,
+    lookback_games: int,
+    progress_callback=None,
+    rebuild: bool = False,
+) -> tuple[pd.DataFrame, Path, int]:
+    """Load the persistent Parquet store and append only newly needed games.
+
+    The store may contain later weeks from a previous run.  The returned
+    DataFrame is always filtered to games strictly before ``target_week`` so
+    there is no target-week leakage.
+    """
+    store_path = historical_feature_store_path(
+        first_training_season, target_season, lookback_games
+    )
+    store_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if rebuild and store_path.exists():
+        store_path.unlink()
+
+    if store_path.exists():
+        cached = pd.read_parquet(store_path)
+        if not cached.empty:
+            cached["game_id"] = pd.to_numeric(cached["game_id"], errors="coerce").astype("Int64")
+            cached = cached.dropna(subset=["game_id"]).copy()
+            cached["game_id"] = cached["game_id"].astype(int)
+        if progress_callback is not None:
+            progress_callback(
+                10,
+                f"Historical features: loaded {len(cached):,} persisted rows from Parquet.",
+            )
+    else:
+        cached = pd.DataFrame()
+
+    # Only game IDs already represented by two-sided/one-sided scoring rows are
+    # skipped. The builder will inspect the schedule and create features for
+    # every eligible game not present in this set.
+    cached_game_ids = (
+        set(cached["game_id"].astype(int).unique())
+        if not cached.empty and "game_id" in cached.columns
+        else set()
+    )
+
+    # Determine whether the current target requires any game that is not in the
+    # persisted store. This cheap schedule check avoids invoking the expensive
+    # feature builder when the Parquet file is already current.
+    pbp, schedule = load_model_data(first_training_season, target_season)
+    needed = games_before_target(schedule, target_season, target_week)
+    score_completed = needed["home_score"].notna() & needed["away_score"].notna()
+    completed_mask = needed["completed"].fillna(False).astype(bool) | score_completed
+    needed = needed[
+        completed_mask
+        & (needed["season"] >= first_training_season)
+        & score_completed
+    ].copy()
+    needed = needed[needed.apply(is_sec_game, axis=1)]
+    pbp_game_ids = set(
+        pd.to_numeric(pbp["game_id"], errors="coerce").dropna().astype(int)
+    )
+    needed = needed[needed["game_id"].isin(pbp_game_ids)]
+    needed_ids = set(pd.to_numeric(needed["game_id"], errors="coerce").dropna().astype(int))
+    missing_ids = needed_ids - cached_game_ids
+
+    appended_rows = 0
+    if missing_ids:
+        if progress_callback is not None:
+            progress_callback(
+                15,
+                f"Historical features: {len(missing_ids):,} new games need feature generation.",
+            )
+
+        new_rows = build_historical_training_rows(
+            first_training_season=first_training_season,
+            target_season=target_season,
+            target_week=target_week,
+            lookback_games=lookback_games,
+            progress_callback=progress_callback,
+            exclude_game_ids=cached_game_ids,
+        )
+        appended_rows = len(new_rows)
+
+        if cached.empty:
+            persisted = new_rows.copy()
+        else:
+            persisted = pd.concat([cached, new_rows], ignore_index=True)
+            persisted = persisted.drop_duplicates(
+                subset=["game_id", "team_id", "is_home"], keep="last"
+            )
+
+        persisted = persisted.sort_values(
+            ["season", "week", "start_date", "game_id", "is_home"]
+        ).reset_index(drop=True)
+
+        # Atomic-ish replacement: write beside the live file, then replace it.
+        temp_path = store_path.with_suffix(".tmp.parquet")
+        persisted.to_parquet(temp_path, index=False)
+        temp_path.replace(store_path)
+        cached = persisted
+    elif progress_callback is not None:
+        progress_callback(100, "Historical features: Parquet store is already current.")
+
+    training_rows = rows_before_target(cached, target_season, target_week)
+    if training_rows.empty:
+        raise ValueError("No historical training rows are available in the feature store.")
+
+    return training_rows, store_path, appended_rows
 
 
 # =============================================================================
@@ -1497,43 +1651,81 @@ def score_percentile(scores, percentile: float) -> float:
 # =============================================================================
 
 
+@dataclass
+class ResidualSimulationBundle:
+    """Only the held-out residuals needed after the Random Forest is released."""
+
+    paired_residuals: pd.DataFrame
+    all_residuals: np.ndarray
+
+
+def release_runtime_memory() -> None:
+    """Return unused Python/ROCm memory after an expensive one-shot operation."""
+    gc.collect()
+    if torch is not None:
+        try:
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception:
+            pass
+
+
+# Remove objects left behind by older versions of this page that cached complete
+# RandomForestRegressor objects in Streamlit session state.
+legacy_models = st.session_state.pop("_trained_model_cache", None)
+if legacy_models is not None:
+    del legacy_models
+    release_runtime_memory()
+
+
 st.title("🏈 SEC Weekly Score Probability Model")
 st.caption(
     "Custom regression model trained on SportsDataverse CFB play-by-play features. "
-    "Monte Carlo uncertainty is sampled from prediction errors on chronologically held-out games."
+    "The Random Forest exists only while a requested configuration is being "
+    "calculated; completed page results retain only predictions, validation "
+    "statistics, and residuals needed for Monte Carlo simulation."
 )
+
+active_config = st.session_state.get("_active_model_config", {})
+default_season = int(active_config.get("season", DEFAULT_SEASON))
+default_training_start = int(
+    active_config.get(
+        "training_start",
+        min(TRAIN_START_SEASON, default_season - 1),
+    )
+)
+default_lookback = int(active_config.get("lookback_games", LOOKBACK_GAMES))
+default_week = int(active_config.get("week", 1))
+default_week = min(max(default_week, 1), 16)
 
 with st.sidebar:
     st.header("Model settings")
 
-    # Keep all configuration widgets inside a form. Streamlit does not rerun the
-    # app for each widget change inside a form; values are committed together
-    # only when the submit button is pressed.
     with st.form("model_config_form"):
         season_input = st.number_input(
             "Season",
             min_value=2023,
             max_value=DEFAULT_SEASON + 1,
-            value=DEFAULT_SEASON,
+            value=default_season,
             step=1,
         )
         training_start_input = st.number_input(
             "First training season",
             min_value=2018,
             max_value=int(season_input) - 1,
-            value=min(TRAIN_START_SEASON, int(season_input) - 1),
+            value=min(default_training_start, int(season_input) - 1),
             step=1,
         )
         lookback_games_input = st.slider(
             "Recent games used for team features",
             min_value=3,
             max_value=15,
-            value=LOOKBACK_GAMES,
+            value=default_lookback,
         )
         week_input = st.selectbox(
             "Week",
             options=list(range(1, 17)),
-            index=0,
+            index=default_week - 1,
         )
 
         run_model = st.form_submit_button(
@@ -1547,156 +1739,134 @@ with st.sidebar:
     else:
         st.warning("GPU unavailable — using CPU")
 
-    if st.button("Clear model caches", use_container_width=True):
-        st.session_state.pop("_historical_training_rows_cache", None)
-        st.session_state.pop("_trained_model_cache", None)
-        st.session_state.pop("_active_model_config", None)
-        st.rerun()
+    rebuild_historical = st.button(
+        "Rebuild historical data",
+        use_container_width=True,
+    )
 
-# Commit a new configuration only when the form is submitted. Until then the
-# rest of the page uses the last submitted configuration, if one exists.
+    clear_results = st.button(
+        "Clear saved results",
+        use_container_width=True,
+    )
+
+if clear_results:
+    old_result = st.session_state.pop("_score_predictor_result", None)
+    st.session_state.pop("_active_model_config", None)
+    st.session_state.pop("_rebuild_historical_data_requested", None)
+    if old_result is not None:
+        del old_result
+    try:
+        load_model_data.clear()
+    except Exception:
+        pass
+    release_runtime_memory()
+    st.rerun()
+
+should_calculate = False
+rebuild_now = False
+
 if run_model:
-    st.session_state["_active_model_config"] = {
+    config = {
         "season": int(season_input),
         "training_start": int(training_start_input),
         "lookback_games": int(lookback_games_input),
         "week": int(week_input),
     }
-
-if "_active_model_config" not in st.session_state:
-    st.info(
-        "Choose the model settings in the sidebar, then click "
-        "**Apply settings & train** to load data and train the model."
-    )
-    st.stop()
-
-config = st.session_state["_active_model_config"]
-season = int(config["season"])
-training_start = int(config["training_start"])
-lookback_games = int(config["lookback_games"])
-week = int(config["week"])
-
-with st.spinner("Loading SportsDataverse play-by-play and schedules..."):
-    pbp, schedule = load_model_data(training_start, season)
-
-available_weeks = sorted(
-    schedule[schedule["season"] == season]["week"].dropna().astype(int).unique()
-)
-
-if not available_weeks:
-    st.error(f"No weeks were found for the {season} season.")
-    st.stop()
-
-if week not in available_weeks:
-    st.error(
-        f"Week {week} is not available for the {season} season. "
-        "Choose another week in the sidebar and click **Apply settings & train** again."
-    )
-    st.stop()
-
-st.caption(
-    f"Active configuration: {season} Week {week} • training begins {training_start} • "
-    f"{lookback_games}-game feature lookback"
-)
-
-st.subheader("Model preparation")
-
-feature_progress = st.progress(
-    0,
-    text="Historical features: preparing data...",
-)
-
-def update_feature_progress(value: int, message: str) -> None:
-    feature_progress.progress(
-        min(max(int(value), 0), 100),
-        text=message,
-    )
-
-# A progress-reporting function should not be decorated with st.cache_data,
-# because Streamlit tries to replay UI side effects on cache hits. Cache the
-# finished DataFrame explicitly in session_state instead.
-training_cache_key = (
-    "historical_training_rows",
-    training_start,
-    season,
-    week,
-    lookback_games,
-)
-
-training_cache = st.session_state.setdefault(
-    "_historical_training_rows_cache",
-    {},
-)
-
-if training_cache_key in training_cache:
-    training_rows = training_cache[training_cache_key].copy()
-    feature_progress.progress(
-        100,
-        text=(
-            f"Historical features loaded from session cache • "
-            f"{len(training_rows):,} scoring rows ready"
-        ),
-    )
+    st.session_state["_active_model_config"] = config
+    should_calculate = True
+elif rebuild_historical:
+    config = st.session_state.get("_active_model_config")
+    if config is None:
+        st.warning(
+            "Choose the model settings and click **Apply settings & train** "
+            "before rebuilding historical data."
+        )
+        st.stop()
+    config = {key: int(value) for key, value in config.items()}
+    should_calculate = True
+    rebuild_now = True
 else:
-    training_rows = build_historical_training_rows(
-        first_training_season=training_start,
-        target_season=season,
-        target_week=week,
-        lookback_games=lookback_games,
-        progress_callback=update_feature_progress,
+    config = st.session_state.get("_active_model_config")
+
+if should_calculate:
+    season = int(config["season"])
+    training_start = int(config["training_start"])
+    lookback_games = int(config["lookback_games"])
+    week = int(config["week"])
+
+    with st.spinner("Loading SportsDataverse play-by-play and schedules..."):
+        pbp, schedule = load_model_data(training_start, season)
+
+    available_weeks = sorted(
+        schedule[schedule["season"] == season]["week"]
+        .dropna()
+        .astype(int)
+        .unique()
     )
 
-    training_cache[training_cache_key] = training_rows.copy()
+    if not available_weeks:
+        st.error(f"No weeks were found for the {season} season.")
+        st.stop()
+
+    if week not in available_weeks:
+        st.error(
+            f"Week {week} is not available for the {season} season. "
+            "Choose another week in the sidebar and click "
+            "**Apply settings & train** again."
+        )
+        st.stop()
+
+    st.subheader("Model preparation")
+
+    feature_progress = st.progress(
+        0,
+        text="Historical features: preparing data...",
+    )
+
+    def update_feature_progress(value: int, message: str) -> None:
+        feature_progress.progress(
+            min(max(int(value), 0), 100),
+            text=message,
+        )
+
+    training_rows, feature_store_path, appended_feature_rows = (
+        load_incremental_historical_features(
+            first_training_season=training_start,
+            target_season=season,
+            target_week=week,
+            lookback_games=lookback_games,
+            progress_callback=update_feature_progress,
+            rebuild=rebuild_now,
+        )
+    )
 
     feature_progress.progress(
         100,
         text=(
-            f"Historical feature generation complete • "
-            f"{len(training_rows):,} scoring rows ready"
+            f"Historical features ready • {len(training_rows):,} scoring rows • "
+            f"{appended_feature_rows:,} new rows persisted"
         ),
     )
 
-training_progress = st.progress(
-    0,
-    text="Model training/validation: preparing...",
-)
-
-def update_training_progress(value: int, message: str) -> None:
-    training_progress.progress(
-        min(max(int(value), 0), 100),
-        text=message,
+    training_progress = st.progress(
+        0,
+        text="Model training/validation: preparing...",
     )
 
-# Keep trained models in session_state. Streamlit reruns the script for normal
-# widgets such as the matchup selector; this prevents those reruns from fitting
-# the validation and production Random Forests again.
-model_cache = st.session_state.setdefault(
-    "_trained_model_cache",
-    {},
-)
+    def update_training_progress(value: int, message: str) -> None:
+        training_progress.progress(
+            min(max(int(value), 0), 100),
+            text=message,
+        )
 
-model_cache_key = (
-    training_start,
-    season,
-    week,
-    lookback_games,
-)
-
-if model_cache_key in model_cache:
-    bundle = model_cache[model_cache_key]
-    training_progress.progress(
-        100,
-        text=(
-            f"Model loaded from session cache • validation MAE {bundle.mae:.2f} pts • "
-            f"RMSE {bundle.rmse:.2f} pts"
-        ),
-    )
-else:
+    # The Random Forest is intentionally local to this calculation. It is NOT
+    # written to session_state and is released after all required predictions
+    # have been produced.
     bundle = train_and_validate_model(
         training_rows,
         progress_callback=update_training_progress,
     )
-    model_cache[model_cache_key] = bundle
+
     training_progress.progress(
         100,
         text=(
@@ -1705,95 +1875,191 @@ else:
         ),
     )
 
+    feature_importance = pd.DataFrame(
+        {
+            "Feature": FEATURE_COLUMNS,
+            "Importance": bundle.model.feature_importances_,
+        }
+    ).sort_values("Importance", ascending=False)
+
+    validation_preview = bundle.validation_results.copy()
+    validation_preview["predicted_points"] = (
+        validation_preview["predicted_points"].round(1)
+    )
+    validation_preview["residual"] = validation_preview["residual"].round(1)
+
+    sec_games = get_sec_week_games(schedule, season, week)
+    if sec_games.empty:
+        st.warning(
+            f"No SEC-related games were found for {season} Week {week}."
+        )
+        st.stop()
+
+    with st.spinner(
+        "Creating current-week matchup features and score predictions..."
+    ):
+        predictions = add_current_predictions(
+            sec_games,
+            pbp,
+            bundle.model,
+            season=season,
+            week=week,
+            lookback_games=lookback_games,
+        )
+
+    summary_home_sim, summary_away_sim = simulate_games_from_residuals(
+        predictions["expected_home_score"].to_numpy(dtype=float),
+        predictions["expected_away_score"].to_numpy(dtype=float),
+        bundle=bundle,
+        n=10_000,
+        seed=RANDOM_SEED + season * 100_003 + week,
+    )
+    summary_home_win, summary_away_win, summary_tie = (
+        game_probabilities_batch(
+            summary_home_sim,
+            summary_away_sim,
+        )
+    )
+
+    summary_rows = []
+    for index, game in enumerate(predictions.itertuples(index=False)):
+        home_win = float(summary_home_win[index])
+        away_win = float(summary_away_win[index])
+        summary_rows.append(
+            {
+                "Away": game.away_team,
+                "Home": game.home_team,
+                "Away expected": round(float(game.expected_away_score), 1),
+                "Home expected": round(float(game.expected_home_score), 1),
+                "Away win %": round(100 * away_win, 1),
+                "Home win %": round(100 * home_win, 1),
+                "Completed": bool(game.completed),
+                "Actual": (
+                    f"{int(game.away_score)}-{int(game.home_score)}"
+                    if bool(game.completed)
+                    and pd.notna(game.away_score)
+                    and pd.notna(game.home_score)
+                    else ""
+                ),
+            }
+        )
+
+    result = {
+        "config": dict(config),
+        "feature_store_path": str(feature_store_path),
+        "appended_feature_rows": int(appended_feature_rows),
+        "training_rows_count": int(len(training_rows)),
+        "train_rows": int(bundle.train_rows),
+        "validation_rows": int(bundle.validation_rows),
+        "mae": float(bundle.mae),
+        "rmse": float(bundle.rmse),
+        "r2": float(bundle.r2),
+        "feature_importance": feature_importance,
+        "validation_results": validation_preview,
+        "predictions": predictions,
+        "summary_rows": pd.DataFrame(summary_rows),
+        "paired_residuals": bundle.paired_residuals.copy(),
+        "all_residuals": np.asarray(
+            bundle.all_residuals,
+            dtype=np.float32,
+        ).copy(),
+    }
+    st.session_state["_score_predictor_result"] = result
+
+    # Explicitly release the two Random Forests' surviving production object,
+    # historical training frame, raw PBP/schedule, and temporary GPU tensors.
+    del bundle
+    del training_rows
+    del pbp
+    del schedule
+    del sec_games
+    del summary_home_sim
+    del summary_away_sim
+    del summary_home_win
+    del summary_away_win
+    del summary_tie
+
+    # load_model_data is useful during the one-shot calculation because the
+    # incremental feature store calls it too. Once the result is complete, its
+    # large cached PBP/schedule copy is no longer needed.
+    try:
+        load_model_data.clear()
+    except Exception:
+        pass
+
+    release_runtime_memory()
+
+result = st.session_state.get("_score_predictor_result")
+
+if result is None:
+    st.info(
+        "Choose the model settings in the sidebar, then click "
+        "**Apply settings & train**. The trained Random Forest will be "
+        "discarded after its predictions are produced."
+    )
+    st.stop()
+
+config = result["config"]
+season = int(config["season"])
+training_start = int(config["training_start"])
+lookback_games = int(config["lookback_games"])
+week = int(config["week"])
+predictions = result["predictions"]
+
+st.caption(
+    f"Active configuration: {season} Week {week} • training begins "
+    f"{training_start} • {lookback_games}-game feature lookback"
+)
+st.caption(
+    f"Persistent feature store: `{result['feature_store_path']}` • "
+    "Random Forest released after prediction"
+)
+
 # -----------------------------------------------------------------------------
 # Model validation
 # -----------------------------------------------------------------------------
 
 st.subheader("Model validation")
 metric1, metric2, metric3, metric4 = st.columns(4)
-metric1.metric("Validation MAE", f"{bundle.mae:.2f} pts")
-metric2.metric("Validation RMSE", f"{bundle.rmse:.2f} pts")
-metric3.metric("Validation R²", f"{bundle.r2:.3f}")
-metric4.metric("Historical feature rows", f"{len(training_rows):,}")
+metric1.metric("Validation MAE", f"{result['mae']:.2f} pts")
+metric2.metric("Validation RMSE", f"{result['rmse']:.2f} pts")
+metric3.metric("Validation R²", f"{result['r2']:.3f}")
+metric4.metric(
+    "Historical feature rows",
+    f"{result['training_rows_count']:,}",
+)
 
 st.caption(
-    f"Validation used {bundle.validation_rows:,} scoring rows from the newest held-out "
-    f"historical games; the model was then refit on all {len(training_rows):,} rows. "
-    f"Monte Carlo samples only the held-out residuals, not training errors."
+    f"Validation used {result['validation_rows']:,} scoring rows from the "
+    "newest held-out historical games; the model was then refit on all "
+    f"{result['training_rows_count']:,} rows. Monte Carlo samples only the "
+    "held-out residuals. The Random Forest itself is no longer resident."
 )
 
 with st.expander("Feature importance"):
-    importance = pd.DataFrame(
-        {
-            "Feature": FEATURE_COLUMNS,
-            "Importance": bundle.model.feature_importances_,
-        }
-    ).sort_values("Importance", ascending=False)
-    st.dataframe(importance, hide_index=True, use_container_width=True)
+    st.dataframe(
+        result["feature_importance"],
+        hide_index=True,
+        use_container_width=True,
+    )
 
 with st.expander("Validation predictions"):
-    preview = bundle.validation_results.copy()
-    preview["predicted_points"] = preview["predicted_points"].round(1)
-    preview["residual"] = preview["residual"].round(1)
-    st.dataframe(preview, hide_index=True, use_container_width=True)
+    st.dataframe(
+        result["validation_results"],
+        hide_index=True,
+        use_container_width=True,
+    )
 
 # -----------------------------------------------------------------------------
 # Current-week predictions
 # -----------------------------------------------------------------------------
 
-sec_games = get_sec_week_games(schedule, int(season), int(week))
-
-if sec_games.empty:
-    st.warning(f"No SEC-related games were found for {int(season)} Week {int(week)}.")
-    st.stop()
-
-with st.spinner("Creating current-week matchup features and score predictions..."):
-    predictions = add_current_predictions(
-        sec_games,
-        pbp,
-        bundle.model,
-        season=int(season),
-        week=int(week),
-        lookback_games=int(lookback_games),
-    )
-
-summary_home_sim, summary_away_sim = simulate_games_from_residuals(
-    predictions["expected_home_score"].to_numpy(dtype=float),
-    predictions["expected_away_score"].to_numpy(dtype=float),
-    bundle=bundle,
-    n=10_000,
-    seed=RANDOM_SEED + int(season) * 100_003 + int(week),
+st.subheader(f"SEC Week {week} predictions")
+st.dataframe(
+    result["summary_rows"],
+    hide_index=True,
+    use_container_width=True,
 )
-summary_home_win, summary_away_win, summary_tie = game_probabilities_batch(
-    summary_home_sim,
-    summary_away_sim,
-)
-
-summary_rows = []
-for index, game in enumerate(predictions.itertuples(index=False)):
-    home_win = float(summary_home_win[index])
-    away_win = float(summary_away_win[index])
-    summary_rows.append(
-        {
-            "Away": game.away_team,
-            "Home": game.home_team,
-            "Away expected": round(float(game.expected_away_score), 1),
-            "Home expected": round(float(game.expected_home_score), 1),
-            "Away win %": round(100 * away_win, 1),
-            "Home win %": round(100 * home_win, 1),
-            "Completed": bool(game.completed),
-            "Actual": (
-                f"{int(game.away_score)}-{int(game.home_score)}"
-                if bool(game.completed)
-                and pd.notna(game.away_score)
-                and pd.notna(game.home_score)
-                else ""
-            ),
-        }
-    )
-
-st.subheader(f"SEC Week {int(week)} predictions")
-st.dataframe(pd.DataFrame(summary_rows), hide_index=True, use_container_width=True)
 
 # -----------------------------------------------------------------------------
 # Matchup drill-down
@@ -1810,15 +2076,63 @@ selected_game_id = st.selectbox(
 )
 selected = predictions[predictions["game_id"] == selected_game_id].iloc[0]
 
+# Recreate only the tiny residual bundle needed by the Monte Carlo functions.
+# It is deliberately temporary so _torch_residuals() cannot leave GPU tensors
+# attached to a long-lived object in session_state.
+simulation_bundle = ResidualSimulationBundle(
+    paired_residuals=result["paired_residuals"],
+    all_residuals=result["all_residuals"],
+)
+
 home_scores, away_scores = simulate_game_from_residuals(
     expected_home=float(selected["expected_home_score"]),
     expected_away=float(selected["expected_away_score"]),
-    bundle=bundle,
+    bundle=simulation_bundle,
     n=MONTE_CARLO_SIMS,
     seed=RANDOM_SEED + int(selected_game_id) % 100_000,
 )
 
-home_win, away_win, tie_prob = game_probabilities(home_scores, away_scores)
+home_win, away_win, tie_prob = game_probabilities(
+    home_scores,
+    away_scores,
+)
+away_distribution = score_distribution(away_scores)
+home_distribution = score_distribution(home_scores)
+away_p10 = score_percentile(away_scores, 10)
+away_p90 = score_percentile(away_scores, 90)
+home_p10 = score_percentile(home_scores, 10)
+home_p90 = score_percentile(home_scores, 90)
+
+away_top = (
+    away_distribution.sort_values("Probability", ascending=False)
+    .head(12)
+    .copy()
+)
+away_top["Probability"] = (100 * away_top["Probability"]).round(2)
+
+home_top = (
+    home_distribution.sort_values("Probability", ascending=False)
+    .head(12)
+    .copy()
+)
+home_top["Probability"] = (100 * home_top["Probability"]).round(2)
+
+final_scores = likely_final_scores(home_scores, away_scores)
+final_scores["Probability"] = (100 * final_scores["Probability"]).round(3)
+final_scores = final_scores.rename(
+    columns={
+        "Away": f'{selected["away_team"]} score',
+        "Home": f'{selected["home_team"]} score',
+        "Probability": "Probability %",
+    }
+)
+
+# The large score tensors/arrays are no longer needed once the derived display
+# tables and percentiles have been calculated.
+del home_scores
+del away_scores
+del simulation_bundle
+release_runtime_memory()
 
 st.header(f'{selected["away_team"]} @ {selected["home_team"]}')
 
@@ -1831,67 +2145,90 @@ c2.metric(
     f'{selected["home_team"]} expected score',
     f'{selected["expected_home_score"]:.1f}',
 )
-c3.metric(f'{selected["away_team"]} win', f"{100 * away_win:.1f}%")
-c4.metric(f'{selected["home_team"]} win', f"{100 * home_win:.1f}%")
+c3.metric(
+    f'{selected["away_team"]} win',
+    f"{100 * away_win:.1f}%",
+)
+c4.metric(
+    f'{selected["home_team"]} win',
+    f"{100 * home_win:.1f}%",
+)
 
 if tie_prob > 0:
-    st.caption(f"Regulation-score ties in simulation: {100 * tie_prob:.1f}%")
-
-away_distribution = score_distribution(away_scores)
-home_distribution = score_distribution(home_scores)
+    st.caption(
+        f"Regulation-score ties in simulation: {100 * tie_prob:.1f}%"
+    )
 
 left, right = st.columns(2)
 with left:
     st.subheader(selected["away_team"])
-    st.bar_chart(away_distribution, x="Score", y="Probability")
+    st.bar_chart(
+        away_distribution,
+        x="Score",
+        y="Probability",
+    )
     st.write(
         "80% simulated range:",
-        f"{score_percentile(away_scores, 10):.0f}–{score_percentile(away_scores, 90):.0f}",
+        f"{away_p10:.0f}–{away_p90:.0f}",
     )
 
 with right:
     st.subheader(selected["home_team"])
-    st.bar_chart(home_distribution, x="Score", y="Probability")
+    st.bar_chart(
+        home_distribution,
+        x="Score",
+        y="Probability",
+    )
     st.write(
         "80% simulated range:",
-        f"{score_percentile(home_scores, 10):.0f}–{score_percentile(home_scores, 90):.0f}",
+        f"{home_p10:.0f}–{home_p90:.0f}",
     )
 
 st.subheader("Most likely exact team scores")
 left, right = st.columns(2)
 with left:
-    away_top = away_distribution.sort_values("Probability", ascending=False).head(12).copy()
-    away_top["Probability"] = (100 * away_top["Probability"]).round(2)
-    st.dataframe(away_top, hide_index=True, use_container_width=True)
+    st.dataframe(
+        away_top,
+        hide_index=True,
+        use_container_width=True,
+    )
 with right:
-    home_top = home_distribution.sort_values("Probability", ascending=False).head(12).copy()
-    home_top["Probability"] = (100 * home_top["Probability"]).round(2)
-    st.dataframe(home_top, hide_index=True, use_container_width=True)
+    st.dataframe(
+        home_top,
+        hide_index=True,
+        use_container_width=True,
+    )
 
 st.subheader("Most likely exact final scores")
-final_scores = likely_final_scores(home_scores, away_scores)
-final_scores["Probability"] = (100 * final_scores["Probability"]).round(3)
-final_scores = final_scores.rename(
-    columns={
-        "Away": f'{selected["away_team"]} score',
-        "Home": f'{selected["home_team"]} score',
-        "Probability": "Probability %",
-    }
+st.dataframe(
+    final_scores,
+    hide_index=True,
+    use_container_width=True,
 )
-st.dataframe(final_scores, hide_index=True, use_container_width=True)
 
 with st.expander("Features used for this matchup"):
     feature_view = pd.DataFrame(
         {
             "Feature": FEATURE_COLUMNS,
-            selected["away_team"]: [selected["away_features"][f] for f in FEATURE_COLUMNS],
-            selected["home_team"]: [selected["home_features"][f] for f in FEATURE_COLUMNS],
+            selected["away_team"]: [
+                selected["away_features"][f]
+                for f in FEATURE_COLUMNS
+            ],
+            selected["home_team"]: [
+                selected["home_features"][f]
+                for f in FEATURE_COLUMNS
+            ],
         }
     )
-    st.dataframe(feature_view, hide_index=True, use_container_width=True)
+    st.dataframe(
+        feature_view,
+        hide_index=True,
+        use_container_width=True,
+    )
 
 st.caption(
-    "These are model probabilities, not sportsbook odds. The regression learns expected points "
-    "from historical team/opponent features, and the displayed score probabilities come from "
-    "resampling out-of-sample historical prediction errors."
+    "These are model probabilities, not sportsbook odds. The regression learns "
+    "expected points from historical team/opponent features, and the displayed "
+    "score probabilities come from resampling out-of-sample historical "
+    "prediction errors."
 )
