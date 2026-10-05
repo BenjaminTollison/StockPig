@@ -3,6 +3,7 @@ from __future__ import annotations
 from functools import lru_cache
 from itertools import combinations
 from datetime import datetime, timezone
+import gc
 import html
 import math
 
@@ -659,7 +660,7 @@ def build_print_report(
     goal_recommendations: pd.DataFrame,
     overall_survival: float,
     goal_survival: float,
-    bundle: predictor.ModelBundle,
+    validation_metrics: dict[str, float],
 ) -> str:
     used_text = (
         ", ".join(html.escape(name) for name in already_used_names)
@@ -741,8 +742,8 @@ def build_print_report(
 <div class="summary">
     <div class="card">Overall season survival<strong>{100 * overall_survival:.2f}%</strong></div>
     <div class="card">Survival through Week {int(goal_week)}<strong>{100 * goal_survival:.2f}%</strong></div>
-    <div class="card">Validation MAE<strong>{bundle.mae:.2f} pts</strong></div>
-    <div class="card">Validation RMSE<strong>{bundle.rmse:.2f} pts</strong></div>
+    <div class="card">Validation MAE<strong>{validation_metrics['mae']:.2f} pts</strong></div>
+    <div class="card">Validation RMSE<strong>{validation_metrics['rmse']:.2f} pts</strong></div>
 </div>
 
 <h2>Current SEC Team Ranking</h2>
@@ -923,6 +924,27 @@ if remaining_teams < season_slots:
     )
     st.stop()
 
+# Older versions of this page retained the trained RandomForest bundle and
+# historical feature DataFrame in Streamlit session state. Drop those objects
+# once when this version is loaded; persistent features now live on disk.
+legacy_survival_result = st.session_state.get("_survival_report_result")
+if isinstance(legacy_survival_result, dict) and "bundle" in legacy_survival_result:
+    st.session_state.pop("_survival_report_result", None)
+
+legacy_model_cache = st.session_state.pop("_pickem_model_cache", None)
+legacy_historical_cache = st.session_state.pop("_pickem_historical_cache", None)
+if legacy_model_cache is not None:
+    del legacy_model_cache
+if legacy_historical_cache is not None:
+    del legacy_historical_cache
+gc.collect()
+try:
+    if predictor.torch is not None and predictor.torch.cuda.is_available():
+        predictor.torch.cuda.empty_cache()
+except Exception:
+    pass
+
+
 run_key = (
     int(season),
     int(planning_start_week),
@@ -946,22 +968,6 @@ if execute:
             int(season),
         )
 
-    historical_key = (
-        TRAIN_START_SEASON,
-        int(season),
-        int(planning_start_week),
-        int(lookback_games),
-    )
-
-    historical_cache = st.session_state.setdefault(
-        "_pickem_historical_cache",
-        {},
-    )
-    model_cache = st.session_state.setdefault(
-        "_pickem_model_cache",
-        {},
-    )
-
     data_progress = st.progress(
         0,
         text="Historical features: preparing...",
@@ -973,24 +979,24 @@ if execute:
             text=message,
         )
 
-    if historical_key in historical_cache:
-        training_rows = historical_cache[historical_key].copy()
-        data_progress.progress(
-            100,
-            text=(
-                "Historical training data loaded from session cache • "
-                f"{len(training_rows):,} rows"
-            ),
-        )
-    else:
-        training_rows = predictor.build_historical_training_rows(
+    training_rows, feature_store_path, appended_feature_rows = (
+        predictor.load_incremental_historical_features(
             first_training_season=TRAIN_START_SEASON,
             target_season=int(season),
             target_week=int(planning_start_week),
             lookback_games=int(lookback_games),
             progress_callback=update_data_progress,
         )
-        historical_cache[historical_key] = training_rows.copy()
+    )
+
+    data_progress.progress(
+        100,
+        text=(
+            f"Historical features ready • {len(training_rows):,} rows • "
+            f"{appended_feature_rows:,} new rows persisted"
+        ),
+    )
+    st.caption(f"Persistent feature store: `{feature_store_path}`")
 
     model_progress = st.progress(
         0,
@@ -1003,18 +1009,28 @@ if execute:
             text=message,
         )
 
-    if historical_key in model_cache:
-        bundle = model_cache[historical_key]
-        model_progress.progress(
-            100,
-            text=f"Model loaded from session cache • MAE {bundle.mae:.2f} pts",
-        )
-    else:
-        bundle = predictor.train_and_validate_model(
-            training_rows,
-            progress_callback=update_model_progress,
-        )
-        model_cache[historical_key] = bundle
+    # Train only for this explicit report request. The trained forest is not
+    # retained in session_state after probabilities/report outputs are built.
+    bundle = predictor.train_and_validate_model(
+        training_rows,
+        progress_callback=update_model_progress,
+    )
+
+    model_progress.progress(
+        100,
+        text=(
+            f"Model ready • MAE {bundle.mae:.2f} pts • "
+            "forest will be released after report generation"
+        ),
+    )
+
+    validation_metrics = {
+        "mae": float(bundle.mae),
+        "rmse": float(bundle.rmse),
+        "r2": float(bundle.r2),
+        "validation_rows": int(bundle.validation_rows),
+    }
+    training_rows_count = int(len(training_rows))
 
     ranking_progress = st.progress(
         0,
@@ -1100,28 +1116,49 @@ if execute:
             goal_recommendations=goal_recommendations,
             overall_survival=overall_survival,
             goal_survival=goal_survival,
-            bundle=bundle,
+            validation_metrics=validation_metrics,
         )
 
         st.session_state["_survival_report_result"] = {
             "key": run_key,
-            "bundle": bundle,
             "rankings": rankings,
             "score_predictions": score_predictions,
             "probabilities": probabilities,
-            "overall_survival": overall_survival,
-            "goal_survival": goal_survival,
+            "overall_survival": float(overall_survival),
+            "goal_survival": float(goal_survival),
             "overall_recommendations": overall_recommendations,
             "goal_recommendations": goal_recommendations,
-            "training_rows_count": len(training_rows),
+            "training_rows_count": training_rows_count,
+            "validation_metrics": validation_metrics,
+            "feature_store_path": str(feature_store_path),
+            "appended_feature_rows": int(appended_feature_rows),
             "report_html": report_html,
         }
+
+    # The report tables and metrics are now materialized, so release the large
+    # estimator/training/PBP objects instead of holding them for the session.
+    del bundle
+    del training_rows
+    del pbp
+    del schedule
+
+    try:
+        predictor.load_model_data.clear()
+    except Exception:
+        pass
+
+    gc.collect()
+    try:
+        if predictor.torch is not None and predictor.torch.cuda.is_available():
+            predictor.torch.cuda.empty_cache()
+    except Exception:
+        pass
 
 
 result = st.session_state.get("_survival_report_result")
 
 if result is not None and result.get("key") == run_key:
-    bundle = result["bundle"]
+    metrics = result["validation_metrics"]
 
     st.divider()
 
@@ -1134,10 +1171,14 @@ if result is not None and result.get("key") == run_key:
         f"Survive through Week {int(goal_week)}",
         f'{100 * float(result["goal_survival"]):.2f}%',
     )
-    m3.metric("Validation MAE", f"{bundle.mae:.2f} pts")
+    m3.metric("Validation MAE", f"{metrics['mae']:.2f} pts")
     m4.metric(
         "Training rows",
         f'{int(result["training_rows_count"]):,}',
+    )
+    st.caption(
+        f"Persistent feature store: `{result['feature_store_path']}` • "
+        f"{int(result['appended_feature_rows']):,} new feature rows added this run"
     )
 
     st.subheader(

@@ -1,0 +1,106 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "stockpig"
+version = "0.1.0"
+description = "Streamlit tools for SEC pick'em analysis and fantasy-football modeling."
+# ROCm 10 / the resolved NumPy stack requires Python 3.12+ on the current AMD wheel set.
+requires-python = ">=3.12,<3.15"
+dependencies = [
+    "joblib>=1.4",
+    "numpy>=2.0",
+    "pandas>=2.2",
+    "polars>=1.0",
+    "pyarrow>=16",
+    "requests>=2.31",
+    "scikit-learn>=1.5",
+    "scipy>=1.13",
+    "sportsdataverse==0.1.4",
+    "streamlit>=1.40",
+]
+
+[project.optional-dependencies]
+# Portable PyTorch install for machines that do not use AMD's gfx1201 ROCm wheels.
+torch = [
+    "torch>=2.7",
+    "torchvision>=0.22",
+    "torchaudio>=2.7",
+]
+
+# AMD Radeon gfx1201 / ROCm 10 environment used by this project.
+# The helper packages are declared directly so uv can pin every AMD-only
+# dependency to the explicit AMD index instead of searching PyPI for them.
+amd-gfx1201 = [
+    "torch[device-gfx1201]==2.13.0+rocm10.0.0",
+    "torchvision[device-gfx1201]==0.28.0+rocm10.0.0",
+    "torchaudio==2.11.0.2+rocm10.0.0",
+    "amd-torch-device-gfx12-0==2.13.0+rocm10.0.0",
+    "amd-torch-device-gfx1201==2.13.0+rocm10.0.0",
+    "amd-torchvision-device-gfx1201==0.28.0+rocm10.0.0",
+    "rocm==10.0.0",
+    "rocm-bootstrap==0.1.0",
+    "rocm-sdk-core==10.0.0",
+    "rocm-sdk-device-gfx1201==10.0.0",
+    "rocm-sdk-libraries==10.0.0",
+    "triton==3.8.0+git4cff872c.rocm10.0.0",
+]
+
+[tool.setuptools]
+# StockPig runs directly from the repository with Streamlit. Installing the
+# project provisions dependencies; there is no distributable package tree.
+py-modules = []
+
+[tool.uv]
+conflicts = [
+    [
+        { extra = "torch" },
+        { extra = "amd-gfx1201" },
+    ],
+]
+
+[tool.uv.sources]
+torch = [
+    { index = "amd-rocm", extra = "amd-gfx1201" },
+]
+torchvision = [
+    { index = "amd-rocm", extra = "amd-gfx1201" },
+]
+torchaudio = [
+    { index = "amd-rocm", extra = "amd-gfx1201" },
+]
+amd-torch-device-gfx12-0 = [
+    { index = "amd-rocm", extra = "amd-gfx1201" },
+]
+amd-torch-device-gfx1201 = [
+    { index = "amd-rocm", extra = "amd-gfx1201" },
+]
+amd-torchvision-device-gfx1201 = [
+    { index = "amd-rocm", extra = "amd-gfx1201" },
+]
+rocm = [
+    { index = "amd-rocm", extra = "amd-gfx1201" },
+]
+rocm-bootstrap = [
+    { index = "amd-rocm", extra = "amd-gfx1201" },
+]
+rocm-sdk-core = [
+    { index = "amd-rocm", extra = "amd-gfx1201" },
+]
+rocm-sdk-device-gfx1201 = [
+    { index = "amd-rocm", extra = "amd-gfx1201" },
+]
+rocm-sdk-libraries = [
+    { index = "amd-rocm", extra = "amd-gfx1201" },
+]
+triton = [
+    { index = "amd-rocm", extra = "amd-gfx1201" },
+]
+
+[[tool.uv.index]]
+name = "amd-rocm"
+url = "https://stable.repo.amd.com/rocm/whl-next/"
+# Critical: do not let generic packages such as numpy, requests, jinja2, etc.
+# resolve from AMD's repository merely because AMD also mirrors them.
+explicit = true
