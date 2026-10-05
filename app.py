@@ -37,20 +37,14 @@ pages = {
             icon="🎯",
         ),
         st.Page(
+            "pages/survival_planner.py",
+            title="SEC Survival Planner",
+            icon="🛡️",
+        ),
+        st.Page(
             "pages/sec_ranking.py",
             title="SEC Weekly Rankings",
             icon="🏆",
-        ),
-    ],
-    "NFL Fantasy": [
-        st.Page(
-            "fantasy_football/transformer_test.py",
-            title="Transformer Test",
-            icon="🎯",
-        ),
-        st.Page(
-            "fantasy_football/draft_assistant.py",
-            title="Draft Assistant",
         ),
     ],
 }

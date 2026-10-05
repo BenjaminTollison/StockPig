@@ -1,0 +1,1250 @@
+from __future__ import annotations
+
+from functools import lru_cache
+from itertools import combinations
+from datetime import datetime, timezone
+import html
+import math
+
+import numpy as np
+import pandas as pd
+import streamlit as st
+
+import predictor_core_gpu as predictor
+
+
+# =============================================================================
+# League + ranking configuration
+# =============================================================================
+
+SEASON_WEEKS = list(range(1, 14))
+DOUBLE_PICK_WEEKS = {1, 6, 7}
+TRAIN_START_SEASON = predictor.TRAIN_START_SEASON
+DEFAULT_LOOKBACK_GAMES = predictor.LOOKBACK_GAMES
+PICKEM_MONTE_CARLO_SIMS = (
+    2_000_000
+    if predictor.GPU_ACCELERATION_AVAILABLE
+    else 30_000
+)
+SEC_TEAMS = {
+    333: ("Alabama", "ALA"),
+    8: ("Arkansas", "ARK"),
+    2: ("Auburn", "AUB"),
+    57: ("Florida", "FLA"),
+    61: ("Georgia", "UGA"),
+    96: ("Kentucky", "UK"),
+    99: ("LSU", "LSU"),
+    344: ("Mississippi State", "MSST"),
+    142: ("Missouri", "MIZ"),
+    201: ("Oklahoma", "OU"),
+    145: ("Ole Miss", "MISS"),
+    2579: ("South Carolina", "SC"),
+    2633: ("Tennessee", "TENN"),
+    251: ("Texas", "TEX"),
+    245: ("Texas A&M", "TA&M"),
+    238: ("Vanderbilt", "VAN"),
+}
+TEAM_NAME_TO_ID = {name: team_id for team_id, (name, _) in SEC_TEAMS.items()}
+
+OFFENSE_QUALITY = {
+    "off_epa_per_play": "higher",
+    "off_pass_epa_per_play": "higher",
+    "off_rush_epa_per_play": "higher",
+    "off_success_rate": "higher",
+    "off_turnover_rate": "lower",
+    "off_points_per_game": "higher",
+}
+
+DEFENSE_QUALITY = {
+    "def_epa_allowed_per_play": "lower",
+    "def_pass_epa_allowed_per_play": "lower",
+    "def_rush_epa_allowed_per_play": "lower",
+    "def_success_rate_allowed": "lower",
+    "def_sack_rate": "higher",
+    "def_turnover_forced_rate": "higher",
+    "def_points_allowed_per_game": "lower",
+}
+
+
+# =============================================================================
+# Lightweight setup helpers
+# =============================================================================
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def load_schedule_only(season: int) -> pd.DataFrame:
+    raw = predictor._load_cfb_schedule([int(season)])
+    return predictor.normalize_schedule(raw)
+
+
+def required_picks_for_week(week: int) -> int:
+    return 2 if int(week) in DOUBLE_PICK_WEEKS else 1
+
+
+def picks_required_before_week(week: int) -> int:
+    return sum(
+        required_picks_for_week(w)
+        for w in SEASON_WEEKS
+        if w < int(week)
+    )
+
+
+def picks_required_in_range(start_week: int, end_week: int) -> int:
+    return sum(
+        required_picks_for_week(w)
+        for w in SEASON_WEEKS
+        if int(start_week) <= w <= int(end_week)
+    )
+
+
+# =============================================================================
+# SEC rankings
+# =============================================================================
+
+def _quality_percentile(series: pd.Series, direction: str) -> pd.Series:
+    numeric = pd.to_numeric(series, errors="coerce")
+
+    if direction == "higher":
+        return numeric.rank(pct=True, ascending=True, method="average") * 100
+    if direction == "lower":
+        return numeric.rank(pct=True, ascending=False, method="average") * 100
+    raise ValueError(f"Unknown ranking direction: {direction}")
+
+
+def build_sec_rankings(
+    pbp: pd.DataFrame,
+    season: int,
+    week: int,
+    lookback_games: int,
+    progress_callback=None,
+) -> pd.DataFrame:
+    """Reproduce the SEC ranking methodology without executing sec_ranking.py UI."""
+    context = predictor.make_feature_context(pbp)
+    rows: list[dict] = []
+    total = len(SEC_TEAMS)
+
+    for index, (team_id, (team_name, abbreviation)) in enumerate(
+        SEC_TEAMS.items(),
+        start=1,
+    ):
+        offense = predictor.get_team_offense(
+            context,
+            team_id=int(team_id),
+            season=int(season),
+            week=int(week),
+            lookback_games=int(lookback_games),
+        )
+        defense = predictor.get_team_defense(
+            context,
+            team_id=int(team_id),
+            season=int(season),
+            week=int(week),
+            lookback_games=int(lookback_games),
+        )
+
+        rows.append(
+            {
+                "team_id": int(team_id),
+                "Team": team_name,
+                "Abbreviation": abbreviation,
+                **offense,
+                **defense,
+            }
+        )
+
+        if progress_callback is not None:
+            progress_callback(
+                int(100 * index / total),
+                f"Ranking {team_name}: {index}/{total} SEC teams",
+            )
+
+    ranked = pd.DataFrame(rows)
+
+    # Keep the ranking page robust to a SportsDataverse/stat schema that
+    # temporarily lacks one of the expected inputs.
+    for feature in [*OFFENSE_QUALITY, *DEFENSE_QUALITY]:
+        if feature not in ranked.columns:
+            ranked[feature] = 0.0
+
+    offense_percentiles = []
+    defense_percentiles = []
+
+    for feature, direction in OFFENSE_QUALITY.items():
+        column = f"{feature}__percentile"
+        ranked[column] = _quality_percentile(ranked[feature], direction)
+        offense_percentiles.append(column)
+
+    for feature, direction in DEFENSE_QUALITY.items():
+        column = f"{feature}__percentile"
+        ranked[column] = _quality_percentile(ranked[feature], direction)
+        defense_percentiles.append(column)
+
+    ranked["Offense Score"] = ranked[offense_percentiles].mean(axis=1)
+    ranked["Defense Score"] = ranked[defense_percentiles].mean(axis=1)
+    ranked["Overall Score"] = (
+        ranked["Offense Score"] + ranked["Defense Score"]
+    ) / 2
+
+    ranked["Offense Rank"] = (
+        ranked["Offense Score"].rank(ascending=False, method="min").astype(int)
+    )
+    ranked["Defense Rank"] = (
+        ranked["Defense Score"].rank(ascending=False, method="min").astype(int)
+    )
+    ranked["Overall Rank"] = (
+        ranked["Overall Score"].rank(ascending=False, method="min").astype(int)
+    )
+
+    return (
+        ranked[
+            [
+                "Overall Rank",
+                "Team",
+                "Overall Score",
+                "Offense Rank",
+                "Offense Score",
+                "Defense Rank",
+                "Defense Score",
+            ]
+        ]
+        .sort_values(["Overall Rank", "Team"])
+        .assign(
+            **{
+                "Overall Score": lambda df: df["Overall Score"].round(1),
+                "Offense Score": lambda df: df["Offense Score"].round(1),
+                "Defense Score": lambda df: df["Defense Score"].round(1),
+            }
+        )
+        .reset_index(drop=True)
+    )
+
+
+# =============================================================================
+# Future-game probability generation
+# =============================================================================
+
+def build_weekly_win_probabilities(
+    pbp: pd.DataFrame,
+    schedule: pd.DataFrame,
+    bundle: predictor.ModelBundle,
+    season: int,
+    planning_start_week: int,
+    lookback_games: int,
+    include_completed_games: bool = False,
+    progress_callback=None,
+) -> pd.DataFrame:
+    """Freeze team information at the planning week and simulate Weeks N-13."""
+    context = predictor.make_feature_context(pbp)
+    rows: list[dict] = []
+    feature_rows: list[dict] = []
+    game_records: list[dict] = []
+
+    weeks = [
+        week
+        for week in SEASON_WEEKS
+        if week >= int(planning_start_week)
+    ]
+    total_weeks = max(len(weeks), 1)
+
+    for week_number, week in enumerate(weeks, start=1):
+        games = predictor.get_sec_week_games(schedule, int(season), int(week))
+
+        for game in games.itertuples(index=False):
+            if bool(game.completed) and not include_completed_games:
+                continue
+
+            home_id = int(game.home_id)
+            away_id = int(game.away_id)
+
+            # Future features intentionally use planning_start_week rather than
+            # the future week so no information from future games can leak in.
+            home_features = predictor.build_feature_row(
+                context,
+                offense_team=home_id,
+                defense_team=away_id,
+                is_home=True,
+                season=int(season),
+                week=int(planning_start_week),
+                lookback_games=int(lookback_games),
+            )
+            away_features = predictor.build_feature_row(
+                context,
+                offense_team=away_id,
+                defense_team=home_id,
+                is_home=False,
+                season=int(season),
+                week=int(planning_start_week),
+                lookback_games=int(lookback_games),
+            )
+
+            game_records.append(
+                {
+                    "week": int(week),
+                    "game": game,
+                    "home_id": home_id,
+                    "away_id": away_id,
+                }
+            )
+            feature_rows.extend((home_features, away_features))
+
+        if progress_callback is not None:
+            progress_callback(
+                int(45 * week_number / total_weeks),
+                f"Building future matchup features: Week {week}",
+            )
+
+    if not game_records:
+        return pd.DataFrame(
+            columns=[
+                "week",
+                "team_id",
+                "team",
+                "opponent_id",
+                "opponent",
+                "location",
+                "game_id",
+                "win_probability",
+                "expected_points",
+                "opponent_expected_points",
+            ]
+        )
+
+    if progress_callback is not None:
+        progress_callback(50, f"Predicting {len(game_records):,} future games...")
+
+    X = pd.DataFrame(feature_rows, columns=predictor.FEATURE_COLUMNS)
+    predicted = np.maximum(
+        bundle.model.predict(X).astype(float),
+        0.0,
+    ).reshape(-1, 2)
+    expected_home = predicted[:, 0]
+    expected_away = predicted[:, 1]
+
+    if progress_callback is not None:
+        progress_callback(
+            65,
+            f"Simulating {len(game_records):,} games on {predictor.accelerator_name()}...",
+        )
+
+    home_scores, away_scores = predictor.simulate_games_from_residuals(
+        expected_home=expected_home,
+        expected_away=expected_away,
+        bundle=bundle,
+        n=PICKEM_MONTE_CARLO_SIMS,
+        seed=(
+            predictor.RANDOM_SEED
+            + int(season) * 100_003
+            + int(planning_start_week)
+        ),
+    )
+    home_win, away_win, tie_prob = predictor.game_probabilities_batch(
+        home_scores,
+        away_scores,
+    )
+
+    for index, record in enumerate(game_records):
+        game = record["game"]
+        week = record["week"]
+        home_id = record["home_id"]
+        away_id = record["away_id"]
+
+        home_probability = float(home_win[index] + 0.5 * tie_prob[index])
+        away_probability = float(away_win[index] + 0.5 * tie_prob[index])
+
+        if home_id in SEC_TEAMS:
+            rows.append(
+                {
+                    "week": int(week),
+                    "team_id": home_id,
+                    "team": SEC_TEAMS[home_id][0],
+                    "opponent_id": away_id,
+                    "opponent": (
+                        SEC_TEAMS[away_id][0]
+                        if away_id in SEC_TEAMS
+                        else str(game.away_team)
+                    ),
+                    "location": "Home",
+                    "game_id": int(game.game_id),
+                    "win_probability": home_probability,
+                    "expected_points": float(expected_home[index]),
+                    "opponent_expected_points": float(expected_away[index]),
+                }
+            )
+
+        if away_id in SEC_TEAMS:
+            rows.append(
+                {
+                    "week": int(week),
+                    "team_id": away_id,
+                    "team": SEC_TEAMS[away_id][0],
+                    "opponent_id": home_id,
+                    "opponent": (
+                        SEC_TEAMS[home_id][0]
+                        if home_id in SEC_TEAMS
+                        else str(game.home_team)
+                    ),
+                    "location": "Away",
+                    "game_id": int(game.game_id),
+                    "win_probability": away_probability,
+                    "expected_points": float(expected_away[index]),
+                    "opponent_expected_points": float(expected_home[index]),
+                }
+            )
+
+    if progress_callback is not None:
+        progress_callback(100, "Future SEC probabilities complete.")
+
+    return (
+        pd.DataFrame(rows)
+        .sort_values(
+            ["week", "win_probability", "team"],
+            ascending=[True, False, True],
+        )
+        .reset_index(drop=True)
+    )
+
+
+def score_prediction_table(
+    probabilities: pd.DataFrame,
+    week: int,
+) -> pd.DataFrame:
+    """Create one compact score-prediction row per SEC-related game."""
+    week_rows = probabilities[
+        probabilities["week"] == int(week)
+    ].copy()
+
+    output = []
+    for game_id, group in week_rows.groupby("game_id", sort=False):
+        row = group.iloc[0]
+
+        if row["location"] == "Home":
+            home_team = str(row["team"])
+            away_team = str(row["opponent"])
+            home_score = float(row["expected_points"])
+            away_score = float(row["opponent_expected_points"])
+            home_win = float(row["win_probability"])
+        else:
+            away_team = str(row["team"])
+            home_team = str(row["opponent"])
+            away_score = float(row["expected_points"])
+            home_score = float(row["opponent_expected_points"])
+            home_win = 1.0 - float(row["win_probability"])
+
+        away_win = 1.0 - home_win
+        if home_win >= away_win:
+            favorite = home_team
+            favorite_probability = home_win
+        else:
+            favorite = away_team
+            favorite_probability = away_win
+
+        output.append(
+            {
+                "Game": f"{away_team} @ {home_team}",
+                "Away Pred.": round(away_score, 1),
+                "Home Pred.": round(home_score, 1),
+                "Projected Winner": favorite,
+                "Win %": round(100 * favorite_probability, 1),
+                "Projected Margin": round(abs(home_score - away_score), 1),
+                "Projected Total": round(home_score + away_score, 1),
+            }
+        )
+
+    if not output:
+        return pd.DataFrame(
+            columns=[
+                "Game",
+                "Away Pred.",
+                "Home Pred.",
+                "Projected Winner",
+                "Win %",
+                "Projected Margin",
+                "Projected Total",
+            ]
+        )
+
+    return (
+        pd.DataFrame(output)
+        .sort_values(["Win %", "Game"], ascending=[False, True])
+        .reset_index(drop=True)
+    )
+
+
+# =============================================================================
+# Survival optimizer
+# =============================================================================
+
+def optimize_pickem_plan(
+    probabilities: pd.DataFrame,
+    planning_start_week: int,
+    end_week: int,
+    already_used_team_ids: set[int],
+) -> tuple[float, list[tuple[int, tuple[int, ...]]]]:
+    """Maximize survival probability from planning_start_week through end_week."""
+    weeks = [
+        week
+        for week in SEASON_WEEKS
+        if int(planning_start_week) <= week <= int(end_week)
+    ]
+
+    if not weeks:
+        return 1.0, []
+
+    team_ids = sorted(SEC_TEAMS)
+    bit_for_team = {
+        team_id: 1 << index
+        for index, team_id in enumerate(team_ids)
+    }
+
+    initial_used_mask = 0
+    for team_id in already_used_team_ids:
+        if team_id in bit_for_team:
+            initial_used_mask |= bit_for_team[team_id]
+
+    week_options: dict[int, list[tuple[int, float, tuple[int, ...]]]] = {}
+
+    for week in weeks:
+        week_rows = (
+            probabilities[probabilities["week"] == int(week)]
+            .sort_values("win_probability", ascending=False)
+            .drop_duplicates("team_id")
+        )
+
+        candidates = week_rows.to_dict("records")
+        required = required_picks_for_week(week)
+        options = []
+
+        for combo in combinations(candidates, required):
+            ids = tuple(int(row["team_id"]) for row in combo)
+
+            if required == 2:
+                game_ids = [int(row["game_id"]) for row in combo]
+                if len(set(game_ids)) != 2:
+                    continue
+
+            mask = 0
+            log_probability = 0.0
+            for row in combo:
+                team_id = int(row["team_id"])
+                probability = max(
+                    min(float(row["win_probability"]), 1.0),
+                    1e-9,
+                )
+                mask |= bit_for_team[team_id]
+                log_probability += math.log(probability)
+
+            options.append((mask, log_probability, tuple(sorted(ids))))
+
+        week_options[week] = options
+
+    @lru_cache(maxsize=None)
+    def solve(
+        week_index: int,
+        used_mask: int,
+    ) -> tuple[float, tuple[tuple[int, tuple[int, ...]], ...]]:
+        if week_index >= len(weeks):
+            return 0.0, tuple()
+
+        week = weeks[week_index]
+        best_score = -math.inf
+        best_path: tuple[tuple[int, tuple[int, ...]], ...] = tuple()
+
+        for option_mask, option_logp, team_tuple in week_options.get(week, []):
+            if option_mask & used_mask:
+                continue
+
+            future_score, future_path = solve(
+                week_index + 1,
+                used_mask | option_mask,
+            )
+            if not math.isfinite(future_score):
+                continue
+
+            total_score = option_logp + future_score
+            if total_score > best_score:
+                best_score = total_score
+                best_path = (
+                    (int(week), team_tuple),
+                    *future_path,
+                )
+
+        return best_score, best_path
+
+    best_log_probability, path = solve(0, initial_used_mask)
+
+    if not math.isfinite(best_log_probability):
+        raise ValueError(
+            f"No feasible pick plan exists through Week {int(end_week)} with "
+            "the selected already-used teams and remaining SEC schedule."
+        )
+
+    return float(math.exp(best_log_probability)), list(path)
+
+
+def recommendation_table(
+    plan: list[tuple[int, tuple[int, ...]]],
+    probabilities: pd.DataFrame,
+) -> pd.DataFrame:
+    rows = []
+    cumulative_probability = 1.0
+    lookup = probabilities.set_index(["week", "team_id"], drop=False)
+
+    for week, team_ids in plan:
+        selected = [
+            lookup.loc[(int(week), int(team_id))]
+            for team_id in team_ids
+        ]
+
+        week_probability = float(
+            np.prod(
+                [
+                    float(row["win_probability"])
+                    for row in selected
+                ]
+            )
+        )
+        cumulative_probability *= week_probability
+
+        rows.append(
+            {
+                "Week": int(week),
+                "Picks Required": required_picks_for_week(week),
+                "Recommended Pick(s)": " + ".join(
+                    str(row["team"])
+                    for row in selected
+                ),
+                "Opponent(s)": " + ".join(
+                    (
+                        f'{row["opponent"]} '
+                        f'({"vs" if row["location"] == "Home" else "@"})'
+                    )
+                    for row in selected
+                ),
+                "Win Probability": " + ".join(
+                    f'{100 * float(row["win_probability"]):.1f}%'
+                    for row in selected
+                ),
+                "Week Survival %": round(100 * week_probability, 2),
+                "Cumulative Survival %": round(
+                    100 * cumulative_probability,
+                    2,
+                ),
+            }
+        )
+
+    return pd.DataFrame(rows)
+
+
+# =============================================================================
+# Print-friendly report
+# =============================================================================
+
+def _table_html(df: pd.DataFrame) -> str:
+    return df.to_html(
+        index=False,
+        border=0,
+        classes="report-table",
+        justify="left",
+    )
+
+
+def build_print_report(
+    season: int,
+    planning_start_week: int,
+    goal_week: int,
+    lookback_games: int,
+    already_used_names: list[str],
+    rankings: pd.DataFrame,
+    score_predictions: pd.DataFrame,
+    overall_recommendations: pd.DataFrame,
+    goal_recommendations: pd.DataFrame,
+    overall_survival: float,
+    goal_survival: float,
+    bundle: predictor.ModelBundle,
+) -> str:
+    used_text = (
+        ", ".join(html.escape(name) for name in already_used_names)
+        if already_used_names
+        else "None"
+    )
+    generated = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+    return f"""<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>SEC Pick'em Survival Report</title>
+<style>
+    :root {{
+        font-family: Arial, Helvetica, sans-serif;
+        color: #111;
+        background: #fff;
+    }}
+    body {{
+        margin: 0 auto;
+        max-width: 1100px;
+        padding: 28px;
+        line-height: 1.35;
+    }}
+    h1, h2 {{ margin-bottom: 0.35rem; }}
+    .muted {{ color: #555; }}
+    .summary {{
+        display: grid;
+        grid-template-columns: repeat(4, minmax(0, 1fr));
+        gap: 12px;
+        margin: 18px 0 24px;
+    }}
+    .card {{
+        border: 1px solid #bbb;
+        border-radius: 8px;
+        padding: 12px;
+    }}
+    .card strong {{
+        display: block;
+        font-size: 1.35rem;
+        margin-top: 3px;
+    }}
+    .report-table {{
+        border-collapse: collapse;
+        width: 100%;
+        margin: 10px 0 24px;
+        font-size: 0.9rem;
+    }}
+    .report-table th, .report-table td {{
+        border: 1px solid #bbb;
+        padding: 6px 8px;
+        text-align: left;
+        vertical-align: top;
+    }}
+    .report-table th {{ background: #f1f1f1; }}
+    .page-break {{ break-before: page; page-break-before: always; }}
+    @media print {{
+        body {{ max-width: none; padding: 0; }}
+        .summary {{ grid-template-columns: repeat(4, 1fr); }}
+        h2 {{ break-after: avoid; page-break-after: avoid; }}
+        .report-table {{ break-inside: auto; }}
+        .report-table tr {{ break-inside: avoid; page-break-inside: avoid; }}
+    }}
+</style>
+</head>
+<body>
+<h1>SEC Pick'em Survival Report</h1>
+<p class="muted">Generated {generated}</p>
+
+<p>
+<strong>Season:</strong> {int(season)} &nbsp;|&nbsp;
+<strong>Planning week:</strong> {int(planning_start_week)} &nbsp;|&nbsp;
+<strong>Goal survival week:</strong> {int(goal_week)} &nbsp;|&nbsp;
+<strong>Lookback:</strong> {int(lookback_games)} games
+</p>
+<p><strong>Already-used SEC teams:</strong> {used_text}</p>
+
+<div class="summary">
+    <div class="card">Overall season survival<strong>{100 * overall_survival:.2f}%</strong></div>
+    <div class="card">Survival through Week {int(goal_week)}<strong>{100 * goal_survival:.2f}%</strong></div>
+    <div class="card">Validation MAE<strong>{bundle.mae:.2f} pts</strong></div>
+    <div class="card">Validation RMSE<strong>{bundle.rmse:.2f} pts</strong></div>
+</div>
+
+<h2>Current SEC Team Ranking</h2>
+{_table_html(rankings)}
+
+<h2>Week {int(planning_start_week)} Score Predictor</h2>
+{_table_html(score_predictions)}
+
+<div class="page-break"></div>
+<h2>Best Overall Survival Plan</h2>
+<p>Optimized from Week {int(planning_start_week)} through Week 13.</p>
+{_table_html(overall_recommendations)}
+
+<h2>Best Plan to Reach Goal Week {int(goal_week)}</h2>
+<p>Optimized only through the selected goal horizon.</p>
+{_table_html(goal_recommendations)}
+
+<p class="muted">
+Probabilities are model estimates. Future-week features are frozen at the
+planning week so later results do not leak into the plan. Cross-game outcomes
+are treated as independent when multiplying survival probabilities.
+</p>
+</body>
+</html>
+"""
+
+
+# =============================================================================
+# Streamlit page
+# =============================================================================
+
+st.title("🛡️ SEC Pick'em Survival Planner")
+st.caption(
+    "One run produces the current SEC ranking, the planning-week score "
+    "predictor, a full-season survival plan, a goal-week survival plan, and a "
+    "print-friendly downloadable report."
+)
+
+if predictor.GPU_ACCELERATION_AVAILABLE:
+    st.caption(
+        f"⚡ Monte Carlo accelerator: {predictor.accelerator_name()} "
+        "(ROCm/PyTorch)"
+    )
+else:
+    st.caption("Monte Carlo accelerator: CPU fallback")
+
+st.info(
+    "League rules: one SEC team per week, except Weeks 1, 6, and 7 require "
+    "TWO picks. A team may only be used once all season."
+)
+
+season = st.number_input(
+    "Season",
+    min_value=2024,
+    max_value=predictor.DEFAULT_SEASON + 1,
+    value=predictor.DEFAULT_SEASON,
+    step=1,
+)
+
+with st.spinner("Loading the season schedule..."):
+    schedule_preview = load_schedule_only(int(season))
+
+try:
+    current_week = predictor.get_default_week(
+        schedule_preview,
+        int(season),
+    )
+except ValueError:
+    current_week = 1
+
+current_week = min(max(int(current_week), 1), 13)
+planning_options = SEASON_WEEKS.copy()
+
+planning_start_week = st.selectbox(
+    "Plan beginning with",
+    options=planning_options,
+    index=planning_options.index(current_week),
+    format_func=lambda week: (
+        f"Week {week}"
+        + (" — TWO PICKS" if week in DOUBLE_PICK_WEEKS else "")
+    ),
+)
+
+replay_mode = (
+    int(season) < int(predictor.DEFAULT_SEASON)
+    or int(planning_start_week) < int(current_week)
+)
+if replay_mode:
+    st.caption(
+        "Historical replay mode: completed games are treated as if they were "
+        "still upcoming, while all team features/training data remain frozen "
+        "before the selected planning week."
+    )
+
+goal_options = [
+    week
+    for week in SEASON_WEEKS
+    if week >= int(planning_start_week)
+]
+default_goal_week = min(int(planning_start_week) + 3, 13)
+
+goal_week = st.selectbox(
+    "Goal survival week",
+    options=goal_options,
+    index=goal_options.index(default_goal_week),
+    help=(
+        "The second survival table optimizes only through this week. "
+        "The overall table still optimizes through Week 13."
+    ),
+)
+
+team_names = [
+    SEC_TEAMS[team_id][0]
+    for team_id in sorted(
+        SEC_TEAMS,
+        key=lambda tid: SEC_TEAMS[tid][0],
+    )
+]
+
+already_used_names = st.multiselect(
+    "SEC teams already used this season",
+    options=team_names,
+    help=(
+        "Used teams are removed from both survival optimizations because "
+        "each SEC team can only be selected once."
+    ),
+)
+already_used_ids = {
+    TEAM_NAME_TO_ID[name]
+    for name in already_used_names
+}
+
+lookback_games = st.slider(
+    "Recent games used for rankings/model features",
+    min_value=3,
+    max_value=15,
+    value=DEFAULT_LOOKBACK_GAMES,
+)
+
+expected_previous_picks = picks_required_before_week(
+    int(planning_start_week)
+)
+if len(already_used_ids) != expected_previous_picks:
+    st.warning(
+        f"Entering Week {int(planning_start_week)}, the league format normally "
+        f"implies {expected_previous_picks} previous team selections. You "
+        f"selected {len(already_used_ids)} used teams; your list will be used "
+        "exactly as entered."
+    )
+
+season_slots = picks_required_in_range(
+    int(planning_start_week),
+    13,
+)
+goal_slots = picks_required_in_range(
+    int(planning_start_week),
+    int(goal_week),
+)
+remaining_teams = len(SEC_TEAMS) - len(already_used_ids)
+
+c1, c2, c3, c4 = st.columns(4)
+c1.metric("Unused SEC teams", remaining_teams)
+c2.metric("Picks to Week 13", season_slots)
+c3.metric(f"Picks to goal Week {int(goal_week)}", goal_slots)
+c4.metric(
+    "Double-pick weeks left",
+    sum(
+        1
+        for week in DOUBLE_PICK_WEEKS
+        if week >= int(planning_start_week)
+    ),
+)
+
+if remaining_teams < season_slots:
+    st.error(
+        "There are fewer unused SEC teams than required remaining pick slots "
+        "for the full-season plan. Remove one or more teams from the used list."
+    )
+    st.stop()
+
+run_key = (
+    int(season),
+    int(planning_start_week),
+    int(goal_week),
+    int(lookback_games),
+    tuple(sorted(already_used_ids)),
+)
+
+execute = st.button(
+    "Run training & build survival report",
+    type="primary",
+    use_container_width=True,
+)
+
+if execute:
+    st.session_state["_survival_active_key"] = run_key
+
+    with st.spinner("Loading SportsDataverse play-by-play and schedule..."):
+        pbp, schedule = predictor.load_model_data(
+            TRAIN_START_SEASON,
+            int(season),
+        )
+
+    historical_key = (
+        TRAIN_START_SEASON,
+        int(season),
+        int(planning_start_week),
+        int(lookback_games),
+    )
+
+    historical_cache = st.session_state.setdefault(
+        "_pickem_historical_cache",
+        {},
+    )
+    model_cache = st.session_state.setdefault(
+        "_pickem_model_cache",
+        {},
+    )
+
+    data_progress = st.progress(
+        0,
+        text="Historical features: preparing...",
+    )
+
+    def update_data_progress(value: int, message: str) -> None:
+        data_progress.progress(
+            min(max(int(value), 0), 100),
+            text=message,
+        )
+
+    if historical_key in historical_cache:
+        training_rows = historical_cache[historical_key].copy()
+        data_progress.progress(
+            100,
+            text=(
+                "Historical training data loaded from session cache • "
+                f"{len(training_rows):,} rows"
+            ),
+        )
+    else:
+        training_rows = predictor.build_historical_training_rows(
+            first_training_season=TRAIN_START_SEASON,
+            target_season=int(season),
+            target_week=int(planning_start_week),
+            lookback_games=int(lookback_games),
+            progress_callback=update_data_progress,
+        )
+        historical_cache[historical_key] = training_rows.copy()
+
+    model_progress = st.progress(
+        0,
+        text="Model training/validation: preparing...",
+    )
+
+    def update_model_progress(value: int, message: str) -> None:
+        model_progress.progress(
+            min(max(int(value), 0), 100),
+            text=message,
+        )
+
+    if historical_key in model_cache:
+        bundle = model_cache[historical_key]
+        model_progress.progress(
+            100,
+            text=f"Model loaded from session cache • MAE {bundle.mae:.2f} pts",
+        )
+    else:
+        bundle = predictor.train_and_validate_model(
+            training_rows,
+            progress_callback=update_model_progress,
+        )
+        model_cache[historical_key] = bundle
+
+    ranking_progress = st.progress(
+        0,
+        text="Calculating current SEC rankings...",
+    )
+
+    def update_ranking_progress(value: int, message: str) -> None:
+        ranking_progress.progress(
+            min(max(int(value), 0), 100),
+            text=message,
+        )
+
+    rankings = build_sec_rankings(
+        pbp=pbp,
+        season=int(season),
+        week=int(planning_start_week),
+        lookback_games=int(lookback_games),
+        progress_callback=update_ranking_progress,
+    )
+    ranking_progress.progress(100, text="SEC rankings complete.")
+
+    probability_progress = st.progress(
+        0,
+        text="Calculating future SEC win probabilities...",
+    )
+
+    def update_probability_progress(value: int, message: str) -> None:
+        probability_progress.progress(
+            min(max(int(value), 0), 100),
+            text=message,
+        )
+
+    probabilities = build_weekly_win_probabilities(
+        pbp=pbp,
+        schedule=schedule,
+        bundle=bundle,
+        season=int(season),
+        planning_start_week=int(planning_start_week),
+        lookback_games=int(lookback_games),
+        include_completed_games=bool(replay_mode),
+        progress_callback=update_probability_progress,
+    )
+
+    try:
+        overall_survival, overall_plan = optimize_pickem_plan(
+            probabilities=probabilities,
+            planning_start_week=int(planning_start_week),
+            end_week=13,
+            already_used_team_ids=already_used_ids,
+        )
+        goal_survival, goal_plan = optimize_pickem_plan(
+            probabilities=probabilities,
+            planning_start_week=int(planning_start_week),
+            end_week=int(goal_week),
+            already_used_team_ids=already_used_ids,
+        )
+    except ValueError as exc:
+        st.session_state.pop("_survival_report_result", None)
+        st.error(str(exc))
+    else:
+        overall_recommendations = recommendation_table(
+            overall_plan,
+            probabilities,
+        )
+        goal_recommendations = recommendation_table(
+            goal_plan,
+            probabilities,
+        )
+        score_predictions = score_prediction_table(
+            probabilities,
+            int(planning_start_week),
+        )
+
+        report_html = build_print_report(
+            season=int(season),
+            planning_start_week=int(planning_start_week),
+            goal_week=int(goal_week),
+            lookback_games=int(lookback_games),
+            already_used_names=list(already_used_names),
+            rankings=rankings,
+            score_predictions=score_predictions,
+            overall_recommendations=overall_recommendations,
+            goal_recommendations=goal_recommendations,
+            overall_survival=overall_survival,
+            goal_survival=goal_survival,
+            bundle=bundle,
+        )
+
+        st.session_state["_survival_report_result"] = {
+            "key": run_key,
+            "bundle": bundle,
+            "rankings": rankings,
+            "score_predictions": score_predictions,
+            "probabilities": probabilities,
+            "overall_survival": overall_survival,
+            "goal_survival": goal_survival,
+            "overall_recommendations": overall_recommendations,
+            "goal_recommendations": goal_recommendations,
+            "training_rows_count": len(training_rows),
+            "report_html": report_html,
+        }
+
+
+result = st.session_state.get("_survival_report_result")
+
+if result is not None and result.get("key") == run_key:
+    bundle = result["bundle"]
+
+    st.divider()
+
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric(
+        "Season survival",
+        f'{100 * float(result["overall_survival"]):.2f}%',
+    )
+    m2.metric(
+        f"Survive through Week {int(goal_week)}",
+        f'{100 * float(result["goal_survival"]):.2f}%',
+    )
+    m3.metric("Validation MAE", f"{bundle.mae:.2f} pts")
+    m4.metric(
+        "Training rows",
+        f'{int(result["training_rows_count"]):,}',
+    )
+
+    st.subheader(
+        f"1. Current SEC ranking entering Week {int(planning_start_week)}"
+    )
+    st.dataframe(
+        result["rankings"],
+        hide_index=True,
+        use_container_width=True,
+    )
+
+    st.subheader(
+        f"2. Week {int(planning_start_week)} score predictor"
+    )
+    if result["score_predictions"].empty:
+        st.warning(
+            f"No uncompleted SEC-related games were found for Week "
+            f"{int(planning_start_week)}."
+        )
+    else:
+        st.dataframe(
+            result["score_predictions"],
+            hide_index=True,
+            use_container_width=True,
+        )
+
+    st.subheader("3. Best overall survival plan")
+    st.caption(
+        f"Optimized jointly from Week {int(planning_start_week)} through Week 13."
+    )
+    st.dataframe(
+        result["overall_recommendations"],
+        hide_index=True,
+        use_container_width=True,
+    )
+
+    st.subheader(
+        f"4. Best choices to make it through goal Week {int(goal_week)}"
+    )
+    st.caption(
+        "This horizon can use strong teams more aggressively because it does "
+        "not reserve them for weeks after the selected goal."
+    )
+    st.dataframe(
+        result["goal_recommendations"],
+        hide_index=True,
+        use_container_width=True,
+    )
+
+    st.subheader("5. Print-friendly report")
+    st.download_button(
+        "Download print-friendly HTML report",
+        data=result["report_html"].encode("utf-8"),
+        file_name=(
+            f"sec_pickem_survival_{int(season)}_week_"
+            f"{int(planning_start_week)}_to_{int(goal_week)}.html"
+        ),
+        mime="text/html",
+        use_container_width=True,
+    )
+    st.caption(
+        "Open the downloaded HTML in a browser and use Print → Save as PDF "
+        "for a clean PDF copy."
+    )
+
+    with st.expander("All modeled SEC win probabilities by week"):
+        display = result["probabilities"].copy()
+        display["Win %"] = (
+            100 * display["win_probability"]
+        ).round(1)
+        display["Expected Score"] = display["expected_points"].round(1)
+        display["Opponent Expected"] = display[
+            "opponent_expected_points"
+        ].round(1)
+
+        st.dataframe(
+            display[
+                [
+                    "week",
+                    "team",
+                    "opponent",
+                    "location",
+                    "Win %",
+                    "Expected Score",
+                    "Opponent Expected",
+                ]
+            ].rename(
+                columns={
+                    "week": "Week",
+                    "team": "Team",
+                    "opponent": "Opponent",
+                    "location": "Location",
+                }
+            ),
+            hide_index=True,
+            use_container_width=True,
+        )
+
+    st.warning(
+        "Survival percentages multiply modeled game-level win probabilities "
+        "and therefore assume independence across games. Future-week team "
+        "features are frozen at the planning week to prevent future-data leakage."
+    )
+
+elif not execute:
+    st.caption(
+        "Set the inputs above, including your goal survival week, then click "
+        "**Run training & build survival report**. No model training starts "
+        "until you click the button."
+    )
