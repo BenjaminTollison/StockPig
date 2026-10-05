@@ -1,0 +1,8 @@
+LICENSE
+README.txt
+pyproject.toml
+stockpig.egg-info/PKG-INFO
+stockpig.egg-info/SOURCES.txt
+stockpig.egg-info/dependency_links.txt
+stockpig.egg-info/requires.txt
+stockpig.egg-info/top_level.txt
