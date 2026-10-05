@@ -3,6 +3,7 @@ from __future__ import annotations
 from functools import lru_cache
 from itertools import combinations
 from datetime import datetime, timezone
+import gc
 import html
 import math
 
@@ -26,6 +27,7 @@ PICKEM_MONTE_CARLO_SIMS = (
     if predictor.GPU_ACCELERATION_AVAILABLE
     else 30_000
 )
+SCORE_GRAPH_MONTE_CARLO_SIMS = predictor.MONTE_CARLO_SIMS
 SEC_TEAMS = {
     333: ("Alabama", "ALA"),
     8: ("Arkansas", "ARK"),
@@ -634,6 +636,203 @@ def recommendation_table(
     return pd.DataFrame(rows)
 
 
+
+# =============================================================================
+# Recommended-pick score distributions
+# =============================================================================
+
+def build_recommended_pick_score_charts(
+    probabilities: pd.DataFrame,
+    plan: list[tuple[int, tuple[int, ...]]],
+    bundle: predictor.ModelBundle,
+    planning_start_week: int,
+) -> list[dict]:
+    # Same residual Monte Carlo + score_distribution path as score_predictor_gpu.
+    selected_ids: tuple[int, ...] | None = None
+    for week, team_ids in plan:
+        if int(week) == int(planning_start_week):
+            selected_ids = tuple(int(team_id) for team_id in team_ids)
+            break
+
+    if not selected_ids:
+        return []
+
+    lookup = probabilities.set_index(["week", "team_id"], drop=False)
+    charts: list[dict] = []
+
+    for team_id in selected_ids:
+        row = lookup.loc[(int(planning_start_week), int(team_id))]
+        if isinstance(row, pd.DataFrame):
+            row = row.iloc[0]
+
+        if str(row["location"]) == "Home":
+            expected_home = float(row["expected_points"])
+            expected_away = float(row["opponent_expected_points"])
+            recommended_is_home = True
+            matchup_label = f'{row["opponent"]} @ {row["team"]}'
+        else:
+            expected_home = float(row["opponent_expected_points"])
+            expected_away = float(row["expected_points"])
+            recommended_is_home = False
+            matchup_label = f'{row["team"]} @ {row["opponent"]}'
+
+        game_id = int(row["game_id"])
+        home_scores, away_scores = predictor.simulate_game_from_residuals(
+            expected_home=expected_home,
+            expected_away=expected_away,
+            bundle=bundle,
+            n=int(SCORE_GRAPH_MONTE_CARLO_SIMS),
+            seed=(
+                predictor.RANDOM_SEED
+                + int(planning_start_week) * 10_007
+                + game_id % 100_000
+            ),
+        )
+
+        selected_scores = home_scores if recommended_is_home else away_scores
+        distribution = predictor.score_distribution(selected_scores)
+        p10 = predictor.score_percentile(selected_scores, 10)
+        p90 = predictor.score_percentile(selected_scores, 90)
+
+        charts.append(
+            {
+                "team_id": int(team_id),
+                "team": str(row["team"]),
+                "opponent": str(row["opponent"]),
+                "location": str(row["location"]),
+                "matchup": matchup_label,
+                "expected_score": float(row["expected_points"]),
+                "win_probability": float(row["win_probability"]),
+                "p10": float(p10),
+                "p90": float(p90),
+                "distribution": distribution.reset_index(drop=True),
+            }
+        )
+
+        del selected_scores
+        del home_scores
+        del away_scores
+
+    gc.collect()
+    try:
+        if predictor.torch is not None and predictor.torch.cuda.is_available():
+            predictor.torch.cuda.empty_cache()
+    except Exception:
+        pass
+
+    return charts
+
+
+def _score_distribution_svg(chart: dict) -> str:
+    # Compact print-safe SVG generated from the same distribution shown in Streamlit.
+    distribution = chart["distribution"].copy()
+    if distribution.empty:
+        return "<p>No simulated score distribution is available.</p>"
+
+    distribution["Score"] = pd.to_numeric(
+        distribution["Score"], errors="coerce"
+    )
+    distribution["Probability"] = pd.to_numeric(
+        distribution["Probability"], errors="coerce"
+    )
+    distribution = distribution.dropna().sort_values("Score")
+    if distribution.empty:
+        return "<p>No simulated score distribution is available.</p>"
+
+    scores = distribution["Score"].to_numpy(dtype=float)
+    probabilities = distribution["Probability"].to_numpy(dtype=float)
+
+    width = 760.0
+    height = 250.0
+    left = 46.0
+    right = 12.0
+    top = 16.0
+    bottom = 38.0
+    plot_width = width - left - right
+    plot_height = height - top - bottom
+
+    score_min = float(scores.min())
+    score_max = float(scores.max())
+    score_span = max(score_max - score_min + 1.0, 1.0)
+    max_probability = max(float(probabilities.max()), 1e-9)
+
+    bar_width = max(plot_width / score_span * 0.82, 1.0)
+    bars = []
+    for score, probability in zip(scores, probabilities):
+        x = left + ((float(score) - score_min) / score_span) * plot_width
+        bar_height = (float(probability) / max_probability) * plot_height
+        y = top + plot_height - bar_height
+        bars.append(
+            f'<rect x="{x:.2f}" y="{y:.2f}" width="{bar_width:.2f}" '
+            f'height="{bar_height:.2f}" fill="#4c78a8" />'
+        )
+
+    tick_values = []
+    start_tick = int(math.floor(score_min / 10.0) * 10)
+    end_tick = int(math.ceil(score_max / 10.0) * 10)
+    for value in range(start_tick, end_tick + 1, 10):
+        if score_min <= value <= score_max:
+            tick_values.append(value)
+    if not tick_values:
+        tick_values = [int(round(score_min)), int(round(score_max))]
+    tick_values = sorted(set(tick_values))
+
+    x_ticks = []
+    for value in tick_values:
+        x = left + ((float(value) - score_min) / score_span) * plot_width
+        x_ticks.append(
+            f'<line x1="{x:.2f}" y1="{top + plot_height:.2f}" '
+            f'x2="{x:.2f}" y2="{top + plot_height + 4:.2f}" '
+            f'stroke="#444" stroke-width="1" />'
+            f'<text x="{x:.2f}" y="{height - 12:.2f}" '
+            f'text-anchor="middle" font-size="11">{value}</text>'
+        )
+
+    y_ticks = []
+    for fraction in (0.0, 0.5, 1.0):
+        probability = max_probability * fraction
+        y = top + plot_height - fraction * plot_height
+        y_ticks.append(
+            f'<line x1="{left - 4:.2f}" y1="{y:.2f}" '
+            f'x2="{width - right:.2f}" y2="{y:.2f}" '
+            f'stroke="#ddd" stroke-width="1" />'
+            f'<text x="{left - 7:.2f}" y="{y + 4:.2f}" '
+            f'text-anchor="end" font-size="10">{100 * probability:.1f}%</text>'
+        )
+
+    team = html.escape(str(chart["team"]))
+    opponent = html.escape(str(chart["opponent"]))
+    relation = "vs" if str(chart["location"]) == "Home" else "@"
+
+    return (
+        f'<div class="score-chart-block">'
+        f'<h3>{team} simulated score distribution</h3>'
+        f'<p class="muted">{team} {relation} {opponent} &nbsp;|&nbsp; '
+        f'Expected {float(chart["expected_score"]):.1f} &nbsp;|&nbsp; '
+        f'Win {100 * float(chart["win_probability"]):.1f}% &nbsp;|&nbsp; '
+        f'80% range {float(chart["p10"]):.0f}–{float(chart["p90"]):.0f}</p>'
+        f'<svg viewBox="0 0 {int(width)} {int(height)}" '
+        f'role="img" aria-label="{team} simulated score distribution">'
+        + "".join(y_ticks)
+        + "".join(bars)
+        + f'<line x1="{left:.2f}" y1="{top + plot_height:.2f}" '
+          f'x2="{width - right:.2f}" y2="{top + plot_height:.2f}" '
+          f'stroke="#444" stroke-width="1" />'
+        + "".join(x_ticks)
+        + f'<text x="{left + plot_width / 2:.2f}" y="{height - 1:.2f}" '
+          f'text-anchor="middle" font-size="11">Simulated team score</text>'
+        + "</svg></div>"
+    )
+
+
+def _recommended_score_charts_html(charts: list[dict]) -> str:
+    if not charts:
+        return "<p>No recommended-pick score charts are available.</p>"
+
+    rendered = "".join(_score_distribution_svg(chart) for chart in charts)
+    return f'<div class="score-chart-grid">{rendered}</div>'
+
+
 # =============================================================================
 # Print-friendly report
 # =============================================================================
@@ -657,9 +856,10 @@ def build_print_report(
     score_predictions: pd.DataFrame,
     overall_recommendations: pd.DataFrame,
     goal_recommendations: pd.DataFrame,
+    recommended_score_charts: list[dict],
     overall_survival: float,
     goal_survival: float,
-    bundle: predictor.ModelBundle,
+    validation_metrics: dict[str, float],
 ) -> str:
     used_text = (
         ", ".join(html.escape(name) for name in already_used_names)
@@ -667,6 +867,9 @@ def build_print_report(
         else "None"
     )
     generated = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    score_charts_html = _recommended_score_charts_html(
+        recommended_score_charts
+    )
 
     return f"""<!doctype html>
 <html>
@@ -683,46 +886,95 @@ def build_print_report(
         margin: 0 auto;
         max-width: 1100px;
         padding: 28px;
-        line-height: 1.35;
+        line-height: 1.30;
     }}
-    h1, h2 {{ margin-bottom: 0.35rem; }}
+    h1, h2, h3 {{ margin-bottom: 0.35rem; }}
+    h3 {{ font-size: 1rem; }}
     .muted {{ color: #555; }}
     .summary {{
         display: grid;
         grid-template-columns: repeat(4, minmax(0, 1fr));
-        gap: 12px;
-        margin: 18px 0 24px;
+        gap: 10px;
+        margin: 14px 0 18px;
     }}
     .card {{
         border: 1px solid #bbb;
         border-radius: 8px;
-        padding: 12px;
+        padding: 10px;
     }}
     .card strong {{
         display: block;
-        font-size: 1.35rem;
+        font-size: 1.25rem;
         margin-top: 3px;
     }}
     .report-table {{
         border-collapse: collapse;
         width: 100%;
-        margin: 10px 0 24px;
-        font-size: 0.9rem;
+        margin: 8px 0 18px;
+        font-size: 0.86rem;
     }}
     .report-table th, .report-table td {{
         border: 1px solid #bbb;
-        padding: 6px 8px;
+        padding: 5px 7px;
         text-align: left;
         vertical-align: top;
     }}
     .report-table th {{ background: #f1f1f1; }}
-    .page-break {{ break-before: page; page-break-before: always; }}
+    .page-break {{
+        break-before: page;
+        page-break-before: always;
+    }}
+    .plans-page {{
+        break-inside: avoid;
+        page-break-inside: avoid;
+    }}
+    .plans-page .report-table {{
+        font-size: 0.75rem;
+        margin-bottom: 10px;
+    }}
+    .plans-page .report-table th,
+    .plans-page .report-table td {{
+        padding: 3px 5px;
+    }}
+    .score-chart-grid {{
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 12px;
+        align-items: start;
+    }}
+    .score-chart-grid .score-chart-block:only-child {{
+        grid-column: 1 / -1;
+        max-width: 760px;
+        margin: 0 auto;
+        width: 100%;
+    }}
+    .score-chart-block {{
+        border: 1px solid #ccc;
+        border-radius: 8px;
+        padding: 8px 10px 4px;
+        break-inside: avoid;
+        page-break-inside: avoid;
+    }}
+    .score-chart-block p {{
+        margin-top: 0;
+        font-size: 0.82rem;
+    }}
+    .score-chart-block svg {{
+        display: block;
+        width: 100%;
+        height: auto;
+    }}
     @media print {{
+        @page {{ margin: 0.45in; }}
         body {{ max-width: none; padding: 0; }}
         .summary {{ grid-template-columns: repeat(4, 1fr); }}
-        h2 {{ break-after: avoid; page-break-after: avoid; }}
+        h2, h3 {{ break-after: avoid; page-break-after: avoid; }}
         .report-table {{ break-inside: auto; }}
         .report-table tr {{ break-inside: avoid; page-break-inside: avoid; }}
+        .plans-page {{
+            break-inside: avoid;
+            page-break-inside: avoid;
+        }}
     }}
 </style>
 </head>
@@ -741,24 +993,36 @@ def build_print_report(
 <div class="summary">
     <div class="card">Overall season survival<strong>{100 * overall_survival:.2f}%</strong></div>
     <div class="card">Survival through Week {int(goal_week)}<strong>{100 * goal_survival:.2f}%</strong></div>
-    <div class="card">Validation MAE<strong>{bundle.mae:.2f} pts</strong></div>
-    <div class="card">Validation RMSE<strong>{bundle.rmse:.2f} pts</strong></div>
+    <div class="card">Validation MAE<strong>{validation_metrics['mae']:.2f} pts</strong></div>
+    <div class="card">Validation RMSE<strong>{validation_metrics['rmse']:.2f} pts</strong></div>
 </div>
 
-<h2>Current SEC Team Ranking</h2>
+<h2>1. Current SEC Team Ranking</h2>
 {_table_html(rankings)}
 
-<h2>Week {int(planning_start_week)} Score Predictor</h2>
-{_table_html(score_predictions)}
-
 <div class="page-break"></div>
-<h2>Best Overall Survival Plan</h2>
+<section class="plans-page">
+<h2>2. Best Overall Survival Plan</h2>
 <p>Optimized from Week {int(planning_start_week)} through Week 13.</p>
 {_table_html(overall_recommendations)}
 
-<h2>Best Plan to Reach Goal Week {int(goal_week)}</h2>
+<h2>3. Best Plan to Reach Goal Week {int(goal_week)}</h2>
 <p>Optimized only through the selected goal horizon.</p>
 {_table_html(goal_recommendations)}
+</section>
+
+<div class="page-break"></div>
+<section class="score-page">
+<h2>4. Week {int(planning_start_week)} Score Predictor</h2>
+{_table_html(score_predictions)}
+
+<h2>Recommended Pick Score Simulation</h2>
+<p class="muted">
+The graph(s) below use the Best Overall Survival Plan's Week
+{int(planning_start_week)} pick(s). Double-pick weeks show two graphs.
+</p>
+{score_charts_html}
+</section>
 
 <p class="muted">
 Probabilities are model estimates. Future-week features are frozen at the
@@ -768,6 +1032,7 @@ are treated as independent when multiplying survival probabilities.
 </body>
 </html>
 """
+
 
 
 # =============================================================================
@@ -828,13 +1093,17 @@ planning_start_week = st.selectbox(
 
 replay_mode = (
     int(season) < int(predictor.DEFAULT_SEASON)
-    or int(planning_start_week) < int(current_week)
+    or (
+        int(season) == int(predictor.DEFAULT_SEASON)
+        and int(planning_start_week) <= int(current_week)
+    )
 )
 if replay_mode:
     st.caption(
-        "Historical replay mode: completed games are treated as if they were "
-        "still upcoming, while all team features/training data remain frozen "
-        "before the selected planning week."
+        "Entering-week replay mode: every game from the selected week onward "
+        "is treated as upcoming, even if it has already been completed. Team "
+        "features and model training data remain frozen before the selected "
+        "planning week, so the replay stays leakage-safe."
     )
 
 goal_options = [
@@ -862,14 +1131,46 @@ team_names = [
     )
 ]
 
-already_used_names = st.multiselect(
-    "SEC teams already used this season",
-    options=team_names,
-    help=(
-        "Used teams are removed from both survival optimizations because "
-        "each SEC team can only be selected once."
-    ),
+expected_previous_picks = picks_required_before_week(
+    int(planning_start_week)
 )
+
+# The optimizer starts at the beginning of planning_start_week. A historical
+# replay therefore needs the teams that were unavailable BEFORE that week, not
+# the user's present-day used-team list. Give each replay week its own widget
+# state so changing from the live week back to Week 1/5 cannot silently carry
+# current-season selections into the counterfactual.
+if int(planning_start_week) == 1:
+    already_used_names = []
+    st.caption(
+        "Week 1 replay starts with all 16 SEC teams available. No team can "
+        "have been used before the season begins."
+    )
+elif replay_mode:
+    already_used_names = st.multiselect(
+        f"SEC teams used before replay Week {int(planning_start_week)}",
+        options=team_names,
+        key=(
+            f"_survival_replay_used_"
+            f"{int(season)}_{int(planning_start_week)}"
+        ),
+        help=(
+            "For an exact historical continuation, select only teams that had "
+            "already been used before the selected replay week. Leave this "
+            "empty to model a fresh counterfactual beginning that week."
+        ),
+    )
+else:
+    already_used_names = st.multiselect(
+        f"SEC teams used before Week {int(planning_start_week)}",
+        options=team_names,
+        key="_survival_live_used_teams",
+        help=(
+            "These teams are unavailable to the optimizer because they were "
+            "already selected before the planning week."
+        ),
+    )
+
 already_used_ids = {
     TEAM_NAME_TO_ID[name]
     for name in already_used_names
@@ -882,16 +1183,22 @@ lookback_games = st.slider(
     value=DEFAULT_LOOKBACK_GAMES,
 )
 
-expected_previous_picks = picks_required_before_week(
-    int(planning_start_week)
-)
 if len(already_used_ids) != expected_previous_picks:
-    st.warning(
-        f"Entering Week {int(planning_start_week)}, the league format normally "
-        f"implies {expected_previous_picks} previous team selections. You "
-        f"selected {len(already_used_ids)} used teams; your list will be used "
-        "exactly as entered."
-    )
+    if replay_mode:
+        st.warning(
+            f"Entering replay Week {int(planning_start_week)}, the league "
+            f"format normally implies {expected_previous_picks} previous team "
+            f"selections. You selected {len(already_used_ids)}. The replay "
+            "will use your list exactly as entered; leaving it empty is a "
+            "valid fresh-start counterfactual."
+        )
+    else:
+        st.warning(
+            f"Entering Week {int(planning_start_week)}, the league format "
+            f"normally implies {expected_previous_picks} previous team "
+            f"selections. You selected {len(already_used_ids)} used teams; "
+            "your list will be used exactly as entered."
+        )
 
 season_slots = picks_required_in_range(
     int(planning_start_week),
@@ -923,6 +1230,27 @@ if remaining_teams < season_slots:
     )
     st.stop()
 
+# Older versions of this page retained the trained RandomForest bundle and
+# historical feature DataFrame in Streamlit session state. Drop those objects
+# once when this version is loaded; persistent features now live on disk.
+legacy_survival_result = st.session_state.get("_survival_report_result")
+if isinstance(legacy_survival_result, dict) and "bundle" in legacy_survival_result:
+    st.session_state.pop("_survival_report_result", None)
+
+legacy_model_cache = st.session_state.pop("_pickem_model_cache", None)
+legacy_historical_cache = st.session_state.pop("_pickem_historical_cache", None)
+if legacy_model_cache is not None:
+    del legacy_model_cache
+if legacy_historical_cache is not None:
+    del legacy_historical_cache
+gc.collect()
+try:
+    if predictor.torch is not None and predictor.torch.cuda.is_available():
+        predictor.torch.cuda.empty_cache()
+except Exception:
+    pass
+
+
 run_key = (
     int(season),
     int(planning_start_week),
@@ -946,22 +1274,6 @@ if execute:
             int(season),
         )
 
-    historical_key = (
-        TRAIN_START_SEASON,
-        int(season),
-        int(planning_start_week),
-        int(lookback_games),
-    )
-
-    historical_cache = st.session_state.setdefault(
-        "_pickem_historical_cache",
-        {},
-    )
-    model_cache = st.session_state.setdefault(
-        "_pickem_model_cache",
-        {},
-    )
-
     data_progress = st.progress(
         0,
         text="Historical features: preparing...",
@@ -973,24 +1285,24 @@ if execute:
             text=message,
         )
 
-    if historical_key in historical_cache:
-        training_rows = historical_cache[historical_key].copy()
-        data_progress.progress(
-            100,
-            text=(
-                "Historical training data loaded from session cache • "
-                f"{len(training_rows):,} rows"
-            ),
-        )
-    else:
-        training_rows = predictor.build_historical_training_rows(
+    training_rows, feature_store_path, appended_feature_rows = (
+        predictor.load_incremental_historical_features(
             first_training_season=TRAIN_START_SEASON,
             target_season=int(season),
             target_week=int(planning_start_week),
             lookback_games=int(lookback_games),
             progress_callback=update_data_progress,
         )
-        historical_cache[historical_key] = training_rows.copy()
+    )
+
+    data_progress.progress(
+        100,
+        text=(
+            f"Historical features ready • {len(training_rows):,} rows • "
+            f"{appended_feature_rows:,} new rows persisted"
+        ),
+    )
+    st.caption(f"Persistent feature store: `{feature_store_path}`")
 
     model_progress = st.progress(
         0,
@@ -1003,18 +1315,28 @@ if execute:
             text=message,
         )
 
-    if historical_key in model_cache:
-        bundle = model_cache[historical_key]
-        model_progress.progress(
-            100,
-            text=f"Model loaded from session cache • MAE {bundle.mae:.2f} pts",
-        )
-    else:
-        bundle = predictor.train_and_validate_model(
-            training_rows,
-            progress_callback=update_model_progress,
-        )
-        model_cache[historical_key] = bundle
+    # Train only for this explicit report request. The trained forest is not
+    # retained in session_state after probabilities/report outputs are built.
+    bundle = predictor.train_and_validate_model(
+        training_rows,
+        progress_callback=update_model_progress,
+    )
+
+    model_progress.progress(
+        100,
+        text=(
+            f"Model ready • MAE {bundle.mae:.2f} pts • "
+            "forest will be released after report generation"
+        ),
+    )
+
+    validation_metrics = {
+        "mae": float(bundle.mae),
+        "rmse": float(bundle.rmse),
+        "r2": float(bundle.r2),
+        "validation_rows": int(bundle.validation_rows),
+    }
+    training_rows_count = int(len(training_rows))
 
     ranking_progress = st.progress(
         0,
@@ -1087,6 +1409,12 @@ if execute:
             probabilities,
             int(planning_start_week),
         )
+        recommended_score_charts = build_recommended_pick_score_charts(
+            probabilities=probabilities,
+            plan=overall_plan,
+            bundle=bundle,
+            planning_start_week=int(planning_start_week),
+        )
 
         report_html = build_print_report(
             season=int(season),
@@ -1098,30 +1426,53 @@ if execute:
             score_predictions=score_predictions,
             overall_recommendations=overall_recommendations,
             goal_recommendations=goal_recommendations,
+            recommended_score_charts=recommended_score_charts,
             overall_survival=overall_survival,
             goal_survival=goal_survival,
-            bundle=bundle,
+            validation_metrics=validation_metrics,
         )
 
         st.session_state["_survival_report_result"] = {
             "key": run_key,
-            "bundle": bundle,
             "rankings": rankings,
             "score_predictions": score_predictions,
             "probabilities": probabilities,
-            "overall_survival": overall_survival,
-            "goal_survival": goal_survival,
+            "overall_survival": float(overall_survival),
+            "goal_survival": float(goal_survival),
             "overall_recommendations": overall_recommendations,
             "goal_recommendations": goal_recommendations,
-            "training_rows_count": len(training_rows),
+            "recommended_score_charts": recommended_score_charts,
+            "training_rows_count": training_rows_count,
+            "validation_metrics": validation_metrics,
+            "feature_store_path": str(feature_store_path),
+            "appended_feature_rows": int(appended_feature_rows),
             "report_html": report_html,
         }
+
+    # The report tables and metrics are now materialized, so release the large
+    # estimator/training/PBP objects instead of holding them for the session.
+    del bundle
+    del training_rows
+    del pbp
+    del schedule
+
+    try:
+        predictor.load_model_data.clear()
+    except Exception:
+        pass
+
+    gc.collect()
+    try:
+        if predictor.torch is not None and predictor.torch.cuda.is_available():
+            predictor.torch.cuda.empty_cache()
+    except Exception:
+        pass
 
 
 result = st.session_state.get("_survival_report_result")
 
 if result is not None and result.get("key") == run_key:
-    bundle = result["bundle"]
+    metrics = result["validation_metrics"]
 
     st.divider()
 
@@ -1134,10 +1485,14 @@ if result is not None and result.get("key") == run_key:
         f"Survive through Week {int(goal_week)}",
         f'{100 * float(result["goal_survival"]):.2f}%',
     )
-    m3.metric("Validation MAE", f"{bundle.mae:.2f} pts")
+    m3.metric("Validation MAE", f"{metrics['mae']:.2f} pts")
     m4.metric(
         "Training rows",
         f'{int(result["training_rows_count"]):,}',
+    )
+    st.caption(
+        f"Persistent feature store: `{result['feature_store_path']}` • "
+        f"{int(result['appended_feature_rows']):,} new feature rows added this run"
     )
 
     st.subheader(
@@ -1149,22 +1504,7 @@ if result is not None and result.get("key") == run_key:
         use_container_width=True,
     )
 
-    st.subheader(
-        f"2. Week {int(planning_start_week)} score predictor"
-    )
-    if result["score_predictions"].empty:
-        st.warning(
-            f"No uncompleted SEC-related games were found for Week "
-            f"{int(planning_start_week)}."
-        )
-    else:
-        st.dataframe(
-            result["score_predictions"],
-            hide_index=True,
-            use_container_width=True,
-        )
-
-    st.subheader("3. Best overall survival plan")
+    st.subheader("2. Best overall survival plan")
     st.caption(
         f"Optimized jointly from Week {int(planning_start_week)} through Week 13."
     )
@@ -1175,7 +1515,7 @@ if result is not None and result.get("key") == run_key:
     )
 
     st.subheader(
-        f"4. Best choices to make it through goal Week {int(goal_week)}"
+        f"3. Best choices to make it through goal Week {int(goal_week)}"
     )
     st.caption(
         "This horizon can use strong teams more aggressively because it does "
@@ -1186,6 +1526,68 @@ if result is not None and result.get("key") == run_key:
         hide_index=True,
         use_container_width=True,
     )
+
+    st.subheader(
+        f"4. Week {int(planning_start_week)} score predictor"
+    )
+    if result["score_predictions"].empty:
+        st.warning(
+            f"No SEC-related games were modeled for Week "
+            f"{int(planning_start_week)}."
+        )
+    else:
+        st.dataframe(
+            result["score_predictions"],
+            hide_index=True,
+            use_container_width=True,
+        )
+
+    st.markdown("#### Recommended pick score simulation")
+    score_charts = result.get("recommended_score_charts", [])
+    st.caption(
+        "These Monte Carlo score distributions use the same residual "
+        "simulation path as score_predictor_gpu.py and correspond to the "
+        "Best Overall Survival Plan's pick(s) for this week."
+    )
+
+    if not score_charts:
+        st.warning("No recommended-pick score distributions are available.")
+    elif len(score_charts) == 1:
+        chart = score_charts[0]
+        relation = "vs" if chart["location"] == "Home" else "@"
+        st.markdown(
+            f'**{chart["team"]} {relation} {chart["opponent"]}**'
+        )
+        st.bar_chart(
+            chart["distribution"],
+            x="Score",
+            y="Probability",
+            use_container_width=True,
+        )
+        st.caption(
+            f'Expected score {chart["expected_score"]:.1f} • '
+            f'Win probability {100 * chart["win_probability"]:.1f}% • '
+            f'80% simulated range {chart["p10"]:.0f}–{chart["p90"]:.0f}'
+        )
+    else:
+        columns = st.columns(len(score_charts))
+        for column, chart in zip(columns, score_charts):
+            with column:
+                relation = "vs" if chart["location"] == "Home" else "@"
+                st.markdown(
+                    f'**{chart["team"]} {relation} {chart["opponent"]}**'
+                )
+                st.bar_chart(
+                    chart["distribution"],
+                    x="Score",
+                    y="Probability",
+                    use_container_width=True,
+                )
+                st.caption(
+                    f'Expected {chart["expected_score"]:.1f} • '
+                    f'Win {100 * chart["win_probability"]:.1f}% • '
+                    f'80% range {chart["p10"]:.0f}–{chart["p90"]:.0f}'
+                )
 
     st.subheader("5. Print-friendly report")
     st.download_button(
@@ -1199,8 +1601,9 @@ if result is not None and result.get("key") == run_key:
         use_container_width=True,
     )
     st.caption(
-        "Open the downloaded HTML in a browser and use Print → Save as PDF "
-        "for a clean PDF copy."
+        "The report inserts page breaks between Rankings, the two Best Plan "
+        "tables, and the Week score predictor + simulation graph(s). Open it "
+        "in a browser and use Print → Save as PDF."
     )
 
     with st.expander("All modeled SEC win probabilities by week"):

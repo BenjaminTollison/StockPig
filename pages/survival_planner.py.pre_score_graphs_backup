@@ -27,7 +27,6 @@ PICKEM_MONTE_CARLO_SIMS = (
     if predictor.GPU_ACCELERATION_AVAILABLE
     else 30_000
 )
-SCORE_GRAPH_MONTE_CARLO_SIMS = predictor.MONTE_CARLO_SIMS
 SEC_TEAMS = {
     333: ("Alabama", "ALA"),
     8: ("Arkansas", "ARK"),
@@ -636,353 +635,6 @@ def recommendation_table(
     return pd.DataFrame(rows)
 
 
-
-# =============================================================================
-# Recommended-pick score distributions
-# =============================================================================
-
-def build_recommended_pick_score_charts(
-    probabilities: pd.DataFrame,
-    plan: list[tuple[int, tuple[int, ...]]],
-    bundle: predictor.ModelBundle,
-    planning_start_week: int,
-) -> list[dict]:
-    """Build two-team score distributions for this week's recommended pick(s).
-
-    Uses the same residual Monte Carlo + score_distribution path as
-    score_predictor_gpu.py.  The projected winner is labeled blue in the
-    display layer and the projected loser red.
-    """
-    selected_ids: tuple[int, ...] | None = None
-    for week, team_ids in plan:
-        if int(week) == int(planning_start_week):
-            selected_ids = tuple(int(team_id) for team_id in team_ids)
-            break
-
-    if not selected_ids:
-        return []
-
-    lookup = probabilities.set_index(["week", "team_id"], drop=False)
-    charts: list[dict] = []
-
-    for team_id in selected_ids:
-        row = lookup.loc[(int(planning_start_week), int(team_id))]
-        if isinstance(row, pd.DataFrame):
-            row = row.iloc[0]
-
-        recommended_team = str(row["team"])
-        opponent_team = str(row["opponent"])
-        recommended_win_probability = float(row["win_probability"])
-        opponent_win_probability = 1.0 - recommended_win_probability
-
-        if str(row["location"]) == "Home":
-            expected_home = float(row["expected_points"])
-            expected_away = float(row["opponent_expected_points"])
-            recommended_scores_are_home = True
-            matchup_label = f"{opponent_team} @ {recommended_team}"
-        else:
-            expected_home = float(row["opponent_expected_points"])
-            expected_away = float(row["expected_points"])
-            recommended_scores_are_home = False
-            matchup_label = f"{recommended_team} @ {opponent_team}"
-
-        game_id = int(row["game_id"])
-        home_scores, away_scores = predictor.simulate_game_from_residuals(
-            expected_home=expected_home,
-            expected_away=expected_away,
-            bundle=bundle,
-            n=int(SCORE_GRAPH_MONTE_CARLO_SIMS),
-            seed=(
-                predictor.RANDOM_SEED
-                + int(planning_start_week) * 10_007
-                + game_id % 100_000
-            ),
-        )
-
-        recommended_scores = (
-            home_scores if recommended_scores_are_home else away_scores
-        )
-        opponent_scores = (
-            away_scores if recommended_scores_are_home else home_scores
-        )
-
-        recommended_distribution = predictor.score_distribution(
-            recommended_scores
-        )
-        opponent_distribution = predictor.score_distribution(
-            opponent_scores
-        )
-
-        recommended_p10 = predictor.score_percentile(
-            recommended_scores, 10
-        )
-        recommended_p90 = predictor.score_percentile(
-            recommended_scores, 90
-        )
-        opponent_p10 = predictor.score_percentile(opponent_scores, 10)
-        opponent_p90 = predictor.score_percentile(opponent_scores, 90)
-
-        # Merge both distributions onto one score axis so Streamlit and the
-        # printable SVG use exactly the same data.
-        comparison = (
-            recommended_distribution.rename(
-                columns={"Probability": recommended_team}
-            )
-            .merge(
-                opponent_distribution.rename(
-                    columns={"Probability": opponent_team}
-                ),
-                on="Score",
-                how="outer",
-            )
-            .fillna(0.0)
-            .sort_values("Score")
-            .reset_index(drop=True)
-        )
-
-        if recommended_win_probability >= opponent_win_probability:
-            winner_team = recommended_team
-            loser_team = opponent_team
-            winner_win_probability = recommended_win_probability
-            loser_win_probability = opponent_win_probability
-            winner_expected_score = float(row["expected_points"])
-            loser_expected_score = float(row["opponent_expected_points"])
-            winner_p10 = float(recommended_p10)
-            winner_p90 = float(recommended_p90)
-            loser_p10 = float(opponent_p10)
-            loser_p90 = float(opponent_p90)
-        else:
-            winner_team = opponent_team
-            loser_team = recommended_team
-            winner_win_probability = opponent_win_probability
-            loser_win_probability = recommended_win_probability
-            winner_expected_score = float(row["opponent_expected_points"])
-            loser_expected_score = float(row["expected_points"])
-            winner_p10 = float(opponent_p10)
-            winner_p90 = float(opponent_p90)
-            loser_p10 = float(recommended_p10)
-            loser_p90 = float(recommended_p90)
-
-        charts.append(
-            {
-                "team_id": int(team_id),
-                "recommended_team": recommended_team,
-                "opponent": opponent_team,
-                "location": str(row["location"]),
-                "matchup": matchup_label,
-                "recommended_win_probability": recommended_win_probability,
-                "opponent_win_probability": opponent_win_probability,
-                "recommended_expected_score": float(row["expected_points"]),
-                "opponent_expected_score": float(
-                    row["opponent_expected_points"]
-                ),
-                "recommended_p10": float(recommended_p10),
-                "recommended_p90": float(recommended_p90),
-                "opponent_p10": float(opponent_p10),
-                "opponent_p90": float(opponent_p90),
-                "winner_team": winner_team,
-                "loser_team": loser_team,
-                "winner_win_probability": float(winner_win_probability),
-                "loser_win_probability": float(loser_win_probability),
-                "winner_expected_score": float(winner_expected_score),
-                "loser_expected_score": float(loser_expected_score),
-                "winner_p10": float(winner_p10),
-                "winner_p90": float(winner_p90),
-                "loser_p10": float(loser_p10),
-                "loser_p90": float(loser_p90),
-                "comparison_distribution": comparison,
-            }
-        )
-
-        del recommended_scores
-        del opponent_scores
-        del home_scores
-        del away_scores
-
-    gc.collect()
-    try:
-        if predictor.torch is not None and predictor.torch.cuda.is_available():
-            predictor.torch.cuda.empty_cache()
-    except Exception:
-        pass
-
-    return charts
-
-
-def _score_distribution_svg(chart: dict) -> str:
-    """Render winner (blue) and loser (red) on one print-safe SVG chart."""
-    comparison = chart["comparison_distribution"].copy()
-    if comparison.empty:
-        return "<p>No simulated score distribution is available.</p>"
-
-    winner_team = str(chart["winner_team"])
-    loser_team = str(chart["loser_team"])
-
-    comparison["Score"] = pd.to_numeric(
-        comparison["Score"], errors="coerce"
-    )
-    comparison[winner_team] = pd.to_numeric(
-        comparison[winner_team], errors="coerce"
-    )
-    comparison[loser_team] = pd.to_numeric(
-        comparison[loser_team], errors="coerce"
-    )
-    comparison = comparison.dropna().sort_values("Score")
-    if comparison.empty:
-        return "<p>No simulated score distribution is available.</p>"
-
-    scores = comparison["Score"].to_numpy(dtype=float)
-    winner_probabilities = comparison[winner_team].to_numpy(dtype=float)
-    loser_probabilities = comparison[loser_team].to_numpy(dtype=float)
-
-    width = 760.0
-    height = 270.0
-    left = 46.0
-    right = 12.0
-    top = 38.0
-    bottom = 38.0
-    plot_width = width - left - right
-    plot_height = height - top - bottom
-
-    score_min = float(scores.min())
-    score_max = float(scores.max())
-    score_span = max(score_max - score_min + 1.0, 1.0)
-    max_probability = max(
-        float(winner_probabilities.max()),
-        float(loser_probabilities.max()),
-        1e-9,
-    )
-
-    bucket_width = plot_width / score_span
-    bar_width = max(bucket_width * 0.40, 1.0)
-
-    winner_bars = []
-    loser_bars = []
-    for score, winner_probability, loser_probability in zip(
-        scores,
-        winner_probabilities,
-        loser_probabilities,
-    ):
-        center_x = (
-            left
-            + ((float(score) - score_min + 0.5) / score_span)
-            * plot_width
-        )
-
-        winner_height = (
-            float(winner_probability) / max_probability
-        ) * plot_height
-        winner_y = top + plot_height - winner_height
-        winner_bars.append(
-            f'<rect x="{center_x - bar_width:.2f}" '
-            f'y="{winner_y:.2f}" width="{bar_width:.2f}" '
-            f'height="{winner_height:.2f}" fill="#4c78a8" '
-            f'fill-opacity="0.90" />'
-        )
-
-        loser_height = (
-            float(loser_probability) / max_probability
-        ) * plot_height
-        loser_y = top + plot_height - loser_height
-        loser_bars.append(
-            f'<rect x="{center_x:.2f}" '
-            f'y="{loser_y:.2f}" width="{bar_width:.2f}" '
-            f'height="{loser_height:.2f}" fill="#d62728" '
-            f'fill-opacity="0.82" />'
-        )
-
-    tick_values = []
-    start_tick = int(math.floor(score_min / 10.0) * 10)
-    end_tick = int(math.ceil(score_max / 10.0) * 10)
-    for value in range(start_tick, end_tick + 1, 10):
-        if score_min <= value <= score_max:
-            tick_values.append(value)
-    if not tick_values:
-        tick_values = [int(round(score_min)), int(round(score_max))]
-    tick_values = sorted(set(tick_values))
-
-    x_ticks = []
-    for value in tick_values:
-        x = left + (
-            (float(value) - score_min + 0.5) / score_span
-        ) * plot_width
-        x_ticks.append(
-            f'<line x1="{x:.2f}" y1="{top + plot_height:.2f}" '
-            f'x2="{x:.2f}" y2="{top + plot_height + 4:.2f}" '
-            f'stroke="#444" stroke-width="1" />'
-            f'<text x="{x:.2f}" y="{height - 12:.2f}" '
-            f'text-anchor="middle" font-size="11">{value}</text>'
-        )
-
-    y_ticks = []
-    for fraction in (0.0, 0.5, 1.0):
-        probability = max_probability * fraction
-        y = top + plot_height - fraction * plot_height
-        y_ticks.append(
-            f'<line x1="{left - 4:.2f}" y1="{y:.2f}" '
-            f'x2="{width - right:.2f}" y2="{y:.2f}" '
-            f'stroke="#ddd" stroke-width="1" />'
-            f'<text x="{left - 7:.2f}" y="{y + 4:.2f}" '
-            f'text-anchor="end" font-size="10">'
-            f'{100 * probability:.1f}%</text>'
-        )
-
-    winner_label = html.escape(winner_team)
-    loser_label = html.escape(loser_team)
-    matchup = html.escape(str(chart["matchup"]))
-
-    legend = (
-        f'<rect x="{left:.2f}" y="8" width="11" height="11" '
-        f'fill="#4c78a8" />'
-        f'<text x="{left + 16:.2f}" y="18" font-size="11">'
-        f'{winner_label} — projected winner '
-        f'({100 * float(chart["winner_win_probability"]):.1f}%)'
-        f'</text>'
-        f'<rect x="{left + 300:.2f}" y="8" width="11" height="11" '
-        f'fill="#d62728" />'
-        f'<text x="{left + 316:.2f}" y="18" font-size="11">'
-        f'{loser_label} — projected loser '
-        f'({100 * float(chart["loser_win_probability"]):.1f}%)'
-        f'</text>'
-    )
-
-    return (
-        f'<div class="score-chart-block">'
-        f'<h3>{matchup} simulated score distributions</h3>'
-        f'<p class="muted">'
-        f'<strong style="color:#4c78a8">{winner_label}</strong>: '
-        f'expected {float(chart["winner_expected_score"]):.1f}, '
-        f'80% range {float(chart["winner_p10"]):.0f}–'
-        f'{float(chart["winner_p90"]):.0f} &nbsp;|&nbsp; '
-        f'<strong style="color:#d62728">{loser_label}</strong>: '
-        f'expected {float(chart["loser_expected_score"]):.1f}, '
-        f'80% range {float(chart["loser_p10"]):.0f}–'
-        f'{float(chart["loser_p90"]):.0f}'
-        f'</p>'
-        f'<svg viewBox="0 0 {int(width)} {int(height)}" '
-        f'role="img" aria-label="{matchup} simulated score distributions">'
-        + legend
-        + "".join(y_ticks)
-        + "".join(winner_bars)
-        + "".join(loser_bars)
-        + f'<line x1="{left:.2f}" y1="{top + plot_height:.2f}" '
-          f'x2="{width - right:.2f}" y2="{top + plot_height:.2f}" '
-          f'stroke="#444" stroke-width="1" />'
-        + "".join(x_ticks)
-        + f'<text x="{left + plot_width / 2:.2f}" y="{height - 1:.2f}" '
-          f'text-anchor="middle" font-size="11">Simulated team score</text>'
-        + "</svg></div>"
-    )
-
-
-def _recommended_score_charts_html(charts: list[dict]) -> str:
-    if not charts:
-        return "<p>No recommended-pick score charts are available.</p>"
-
-    rendered = "".join(_score_distribution_svg(chart) for chart in charts)
-    return f'<div class="score-chart-grid">{rendered}</div>'
-
-
 # =============================================================================
 # Print-friendly report
 # =============================================================================
@@ -1006,7 +658,6 @@ def build_print_report(
     score_predictions: pd.DataFrame,
     overall_recommendations: pd.DataFrame,
     goal_recommendations: pd.DataFrame,
-    recommended_score_charts: list[dict],
     overall_survival: float,
     goal_survival: float,
     validation_metrics: dict[str, float],
@@ -1017,9 +668,6 @@ def build_print_report(
         else "None"
     )
     generated = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    score_charts_html = _recommended_score_charts_html(
-        recommended_score_charts
-    )
 
     return f"""<!doctype html>
 <html>
@@ -1036,95 +684,46 @@ def build_print_report(
         margin: 0 auto;
         max-width: 1100px;
         padding: 28px;
-        line-height: 1.30;
+        line-height: 1.35;
     }}
-    h1, h2, h3 {{ margin-bottom: 0.35rem; }}
-    h3 {{ font-size: 1rem; }}
+    h1, h2 {{ margin-bottom: 0.35rem; }}
     .muted {{ color: #555; }}
     .summary {{
         display: grid;
         grid-template-columns: repeat(4, minmax(0, 1fr));
-        gap: 10px;
-        margin: 14px 0 18px;
+        gap: 12px;
+        margin: 18px 0 24px;
     }}
     .card {{
         border: 1px solid #bbb;
         border-radius: 8px;
-        padding: 10px;
+        padding: 12px;
     }}
     .card strong {{
         display: block;
-        font-size: 1.25rem;
+        font-size: 1.35rem;
         margin-top: 3px;
     }}
     .report-table {{
         border-collapse: collapse;
         width: 100%;
-        margin: 8px 0 18px;
-        font-size: 0.86rem;
+        margin: 10px 0 24px;
+        font-size: 0.9rem;
     }}
     .report-table th, .report-table td {{
         border: 1px solid #bbb;
-        padding: 5px 7px;
+        padding: 6px 8px;
         text-align: left;
         vertical-align: top;
     }}
     .report-table th {{ background: #f1f1f1; }}
-    .page-break {{
-        break-before: page;
-        page-break-before: always;
-    }}
-    .plans-page {{
-        break-inside: avoid;
-        page-break-inside: avoid;
-    }}
-    .plans-page .report-table {{
-        font-size: 0.75rem;
-        margin-bottom: 10px;
-    }}
-    .plans-page .report-table th,
-    .plans-page .report-table td {{
-        padding: 3px 5px;
-    }}
-    .score-chart-grid {{
-        display: grid;
-        grid-template-columns: repeat(2, minmax(0, 1fr));
-        gap: 12px;
-        align-items: start;
-    }}
-    .score-chart-grid .score-chart-block:only-child {{
-        grid-column: 1 / -1;
-        max-width: 760px;
-        margin: 0 auto;
-        width: 100%;
-    }}
-    .score-chart-block {{
-        border: 1px solid #ccc;
-        border-radius: 8px;
-        padding: 8px 10px 4px;
-        break-inside: avoid;
-        page-break-inside: avoid;
-    }}
-    .score-chart-block p {{
-        margin-top: 0;
-        font-size: 0.82rem;
-    }}
-    .score-chart-block svg {{
-        display: block;
-        width: 100%;
-        height: auto;
-    }}
+    .page-break {{ break-before: page; page-break-before: always; }}
     @media print {{
-        @page {{ margin: 0.45in; }}
         body {{ max-width: none; padding: 0; }}
         .summary {{ grid-template-columns: repeat(4, 1fr); }}
-        h2, h3 {{ break-after: avoid; page-break-after: avoid; }}
+        h2 {{ break-after: avoid; page-break-after: avoid; }}
         .report-table {{ break-inside: auto; }}
         .report-table tr {{ break-inside: avoid; page-break-inside: avoid; }}
-        .plans-page {{
-            break-inside: avoid;
-            page-break-inside: avoid;
-        }}
     }}
 </style>
 </head>
@@ -1147,33 +746,20 @@ def build_print_report(
     <div class="card">Validation RMSE<strong>{validation_metrics['rmse']:.2f} pts</strong></div>
 </div>
 
-<h2>1. Current SEC Team Ranking</h2>
+<h2>Current SEC Team Ranking</h2>
 {_table_html(rankings)}
 
+<h2>Week {int(planning_start_week)} Score Predictor</h2>
+{_table_html(score_predictions)}
+
 <div class="page-break"></div>
-<section class="plans-page">
-<h2>2. Best Overall Survival Plan</h2>
+<h2>Best Overall Survival Plan</h2>
 <p>Optimized from Week {int(planning_start_week)} through Week 13.</p>
 {_table_html(overall_recommendations)}
 
-<h2>3. Best Plan to Reach Goal Week {int(goal_week)}</h2>
+<h2>Best Plan to Reach Goal Week {int(goal_week)}</h2>
 <p>Optimized only through the selected goal horizon.</p>
 {_table_html(goal_recommendations)}
-</section>
-
-<div class="page-break"></div>
-<section class="score-page">
-<h2>4. Week {int(planning_start_week)} Score Predictor</h2>
-{_table_html(score_predictions)}
-
-<h2>Recommended Pick Score Simulation</h2>
-<p class="muted">
-Each graph compares both teams in the recommended matchup. Blue is the
-model-projected winner and red is the projected loser. Double-pick weeks show
-two matchup graphs.
-</p>
-{score_charts_html}
-</section>
 
 <p class="muted">
 Probabilities are model estimates. Future-week features are frozen at the
@@ -1183,7 +769,6 @@ are treated as independent when multiplying survival probabilities.
 </body>
 </html>
 """
-
 
 
 # =============================================================================
@@ -1560,12 +1145,6 @@ if execute:
             probabilities,
             int(planning_start_week),
         )
-        recommended_score_charts = build_recommended_pick_score_charts(
-            probabilities=probabilities,
-            plan=overall_plan,
-            bundle=bundle,
-            planning_start_week=int(planning_start_week),
-        )
 
         report_html = build_print_report(
             season=int(season),
@@ -1577,7 +1156,6 @@ if execute:
             score_predictions=score_predictions,
             overall_recommendations=overall_recommendations,
             goal_recommendations=goal_recommendations,
-            recommended_score_charts=recommended_score_charts,
             overall_survival=overall_survival,
             goal_survival=goal_survival,
             validation_metrics=validation_metrics,
@@ -1592,7 +1170,6 @@ if execute:
             "goal_survival": float(goal_survival),
             "overall_recommendations": overall_recommendations,
             "goal_recommendations": goal_recommendations,
-            "recommended_score_charts": recommended_score_charts,
             "training_rows_count": training_rows_count,
             "validation_metrics": validation_metrics,
             "feature_store_path": str(feature_store_path),
@@ -1655,7 +1232,22 @@ if result is not None and result.get("key") == run_key:
         use_container_width=True,
     )
 
-    st.subheader("2. Best overall survival plan")
+    st.subheader(
+        f"2. Week {int(planning_start_week)} score predictor"
+    )
+    if result["score_predictions"].empty:
+        st.warning(
+            f"No uncompleted SEC-related games were found for Week "
+            f"{int(planning_start_week)}."
+        )
+    else:
+        st.dataframe(
+            result["score_predictions"],
+            hide_index=True,
+            use_container_width=True,
+        )
+
+    st.subheader("3. Best overall survival plan")
     st.caption(
         f"Optimized jointly from Week {int(planning_start_week)} through Week 13."
     )
@@ -1666,7 +1258,7 @@ if result is not None and result.get("key") == run_key:
     )
 
     st.subheader(
-        f"3. Best choices to make it through goal Week {int(goal_week)}"
+        f"4. Best choices to make it through goal Week {int(goal_week)}"
     )
     st.caption(
         "This horizon can use strong teams more aggressively because it does "
@@ -1677,68 +1269,6 @@ if result is not None and result.get("key") == run_key:
         hide_index=True,
         use_container_width=True,
     )
-
-    st.subheader(
-        f"4. Week {int(planning_start_week)} score predictor"
-    )
-    if result["score_predictions"].empty:
-        st.warning(
-            f"No SEC-related games were modeled for Week "
-            f"{int(planning_start_week)}."
-        )
-    else:
-        st.dataframe(
-            result["score_predictions"],
-            hide_index=True,
-            use_container_width=True,
-        )
-
-    st.markdown("#### Recommended pick score simulation")
-    score_charts = result.get("recommended_score_charts", [])
-    st.caption(
-        "Both teams use the same Monte Carlo simulation as "
-        "score_predictor_gpu.py. Blue is the model-projected winner; red is "
-        "the projected loser."
-    )
-
-    def render_score_comparison(chart: dict) -> None:
-        winner_team = chart["winner_team"]
-        loser_team = chart["loser_team"]
-
-        st.markdown(
-            f'**{chart["matchup"]}** — '
-            f'🔵 {winner_team} vs 🔴 {loser_team}'
-        )
-        st.bar_chart(
-            chart["comparison_distribution"],
-            x="Score",
-            y=[winner_team, loser_team],
-            color=["#4c78a8", "#d62728"],
-            stack=False,
-            use_container_width=True,
-        )
-        st.caption(
-            f'🔵 {winner_team}: '
-            f'{100 * chart["winner_win_probability"]:.1f}% win • '
-            f'expected {chart["winner_expected_score"]:.1f} • '
-            f'80% range {chart["winner_p10"]:.0f}–'
-            f'{chart["winner_p90"]:.0f}  |  '
-            f'🔴 {loser_team}: '
-            f'{100 * chart["loser_win_probability"]:.1f}% win • '
-            f'expected {chart["loser_expected_score"]:.1f} • '
-            f'80% range {chart["loser_p10"]:.0f}–'
-            f'{chart["loser_p90"]:.0f}'
-        )
-
-    if not score_charts:
-        st.warning("No recommended-pick score distributions are available.")
-    elif len(score_charts) == 1:
-        render_score_comparison(score_charts[0])
-    else:
-        columns = st.columns(len(score_charts))
-        for column, chart in zip(columns, score_charts):
-            with column:
-                render_score_comparison(chart)
 
     st.subheader("5. Print-friendly report")
     st.download_button(
@@ -1752,9 +1282,8 @@ if result is not None and result.get("key") == run_key:
         use_container_width=True,
     )
     st.caption(
-        "The report inserts page breaks between Rankings, the two Best Plan "
-        "tables, and the Week score predictor + simulation graph(s). Open it "
-        "in a browser and use Print → Save as PDF."
+        "Open the downloaded HTML in a browser and use Print → Save as PDF "
+        "for a clean PDF copy."
     )
 
     with st.expander("All modeled SEC win probabilities by week"):
