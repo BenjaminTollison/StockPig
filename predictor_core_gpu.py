@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Iterable
 
 import numpy as np
@@ -782,6 +783,7 @@ def build_historical_training_rows(
     target_week: int,
     lookback_games: int,
     progress_callback=None,
+    exclude_game_ids: set[int] | None = None,
 ) -> pd.DataFrame:
     """Create two leakage-safe score rows per historical SEC-related game."""
 
@@ -820,6 +822,9 @@ def build_historical_training_rows(
     diagnostic_counts["schedule_pbp_matched_rows"] = int(len(eligible))
 
     eligible = eligible.sort_values(["season", "week", "start_date", "game_id"])
+
+    if exclude_game_ids:
+        eligible = eligible[~eligible["game_id"].isin(exclude_game_ids)].copy()
 
     rows: list[dict] = []
 
@@ -980,6 +985,121 @@ def build_historical_training_rows(
     return pd.DataFrame(rows).sort_values(
         ["season", "week", "start_date", "game_id", "is_home"]
     ).reset_index(drop=True)
+
+
+# =============================================================================
+# Persistent incremental historical feature store
+# =============================================================================
+
+FEATURE_STORE_DIR = Path(__file__).resolve().parent / "data" / "feature_store"
+
+
+def historical_feature_store_path(
+    first_training_season: int,
+    target_season: int,
+    lookback_games: int,
+) -> Path:
+    return FEATURE_STORE_DIR / (
+        f"historical_features_{first_training_season}_{target_season}_"
+        f"lb{lookback_games}.parquet"
+    )
+
+
+def rows_before_target(
+    rows: pd.DataFrame,
+    target_season: int,
+    target_week: int,
+) -> pd.DataFrame:
+    if rows.empty:
+        return rows.copy()
+    mask = (
+        (rows["season"] < int(target_season))
+        | ((rows["season"] == int(target_season)) & (rows["week"] < int(target_week)))
+    )
+    return rows.loc[mask].copy().sort_values(
+        ["season", "week", "start_date", "game_id", "is_home"]
+    ).reset_index(drop=True)
+
+
+def load_incremental_historical_features(
+    first_training_season: int,
+    target_season: int,
+    target_week: int,
+    lookback_games: int,
+    progress_callback=None,
+    rebuild: bool = False,
+) -> tuple[pd.DataFrame, Path, int]:
+    """Load shared historical features from Parquet and append missing games."""
+    store_path = historical_feature_store_path(
+        int(first_training_season), int(target_season), int(lookback_games)
+    )
+    store_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if rebuild and store_path.exists():
+        store_path.unlink()
+
+    if store_path.exists():
+        cached = pd.read_parquet(store_path)
+        if not cached.empty:
+            cached["game_id"] = pd.to_numeric(cached["game_id"], errors="coerce")
+            cached = cached.dropna(subset=["game_id"]).copy()
+            cached["game_id"] = cached["game_id"].astype(int)
+        if progress_callback is not None:
+            progress_callback(10, f"Historical features: loaded {len(cached):,} persisted rows from Parquet.")
+    else:
+        cached = pd.DataFrame()
+
+    cached_game_ids = (
+        set(cached["game_id"].astype(int).unique())
+        if not cached.empty and "game_id" in cached.columns
+        else set()
+    )
+
+    pbp, schedule = load_model_data(int(first_training_season), int(target_season))
+    needed = games_before_target(schedule, int(target_season), int(target_week))
+    score_completed = needed["home_score"].notna() & needed["away_score"].notna()
+    completed_mask = needed["completed"].fillna(False).astype(bool) | score_completed
+    needed = needed[
+        completed_mask
+        & (needed["season"] >= int(first_training_season))
+        & score_completed
+    ].copy()
+    needed = needed[needed.apply(is_sec_game, axis=1)]
+    pbp_game_ids = set(pd.to_numeric(pbp["game_id"], errors="coerce").dropna().astype(int))
+    needed = needed[needed["game_id"].isin(pbp_game_ids)]
+    needed_ids = set(pd.to_numeric(needed["game_id"], errors="coerce").dropna().astype(int))
+    missing_ids = needed_ids - cached_game_ids
+
+    appended_rows = 0
+    if missing_ids:
+        if progress_callback is not None:
+            progress_callback(15, f"Historical features: {len(missing_ids):,} new games need feature generation.")
+        new_rows = build_historical_training_rows(
+            first_training_season=int(first_training_season),
+            target_season=int(target_season),
+            target_week=int(target_week),
+            lookback_games=int(lookback_games),
+            progress_callback=progress_callback,
+            exclude_game_ids=cached_game_ids,
+        )
+        appended_rows = len(new_rows)
+        persisted = new_rows.copy() if cached.empty else pd.concat([cached, new_rows], ignore_index=True)
+        persisted = persisted.drop_duplicates(
+            subset=["game_id", "team_id", "is_home"], keep="last"
+        ).sort_values(
+            ["season", "week", "start_date", "game_id", "is_home"]
+        ).reset_index(drop=True)
+        temp_path = store_path.with_suffix(".tmp.parquet")
+        persisted.to_parquet(temp_path, index=False)
+        temp_path.replace(store_path)
+        cached = persisted
+    elif progress_callback is not None:
+        progress_callback(100, "Historical features: Parquet store is already current.")
+
+    training_rows = rows_before_target(cached, int(target_season), int(target_week))
+    if training_rows.empty:
+        raise ValueError("No historical training rows are available in the feature store.")
+    return training_rows, store_path, appended_rows
 
 
 # =============================================================================

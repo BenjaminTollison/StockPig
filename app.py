@@ -37,6 +37,11 @@ pages = {
             icon="🎯",
         ),
         st.Page(
+            "pages/survival_planner.py",
+            title="SEC Survival Planner",
+            icon="🛡️",
+        ),
+        st.Page(
             "pages/sec_ranking.py",
             title="SEC Weekly Rankings",
             icon="🏆",
